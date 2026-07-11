@@ -22,6 +22,8 @@ object VoicePing {
 
     private var userId: String? = null
     private var company: String? = null
+    // Non-null when connected via JWT overload; null in legacy company-prefix mode
+    private var jwtToken: String? = null
 
     /**
      * Initialize VoicePing. This process should be done in onCreate of your Application class
@@ -49,36 +51,66 @@ object VoicePing {
     }
 
     /**
-     * Connect to server. This method can be assumed as sign in to server. After the user connected
-     * to server, the user can then receive PTT from any other user using private channel.
+     * Connect using a backend-minted JWT. Channel and user IDs are sent verbatim (no prefix).
+     * The router authenticates via the JWT passed as the VoicePingToken header.
      *
-     * @param userId   User ID or Username
-     * @param callback Callback
+     * @param serverUrl Server WebSocket URL (e.g. from BuildConfig.PTT_ROUTER_URL)
+     * @param jwt       HS256 JWT minted by your backend
+     * @param userId    User ID as known to your backend (stored for startTalking/joinGroup)
+     * @param callback  ConnectCallback
      */
-    fun connect(userId: String, company: String, callback: ConnectCallback) {
-        connect(DEFAULT_SERVER_URL, userId, company, callback)
-    }
-
-    /**
-     * Connect to server. This method can be assumed as sign in to server. After the user connected
-     * to server, the user can then receive PTT from any other user using private channel.
-     *
-     * @param serverUrl Server URL
-     * @param userId    User ID or Username
-     * @param callback  Callback
-     */
-    fun connect(serverUrl: String, userId: String, company: String, callback: ConnectCallback) {
+    fun connect(serverUrl: String, jwt: String, userId: String, callback: ConnectCallback) {
         val realServerUrl = when {
             serverUrl.isBlank() -> DEFAULT_SERVER_URL
             serverUrl.endsWith("/") -> serverUrl.substring(0, serverUrl.length - 1)
             else -> serverUrl
         }
         this.userId = userId
-        this.company = company
+        this.company = null
+        this.jwtToken = jwt
         val deviceId =
             "${Build.MANUFACTURER}_${Build.MODEL}_${Build.FINGERPRINT}_${Build.BOOTLOADER}_${Build.DISPLAY}_${Build.HOST}"
         player.setServerUrl(realServerUrl)
-        connection.connect(realServerUrl, getFullUserId(), deviceId, callback)
+        connection.connect(realServerUrl, jwt, deviceId, callback)
+        recorder.setUserId(userId)
+    }
+
+    /**
+     * Refresh the JWT without a full disconnect/reconnect cycle visible to the user.
+     * Call this before your token expires (backend rotates every 30 min).
+     * Simple impl: disconnects and reconnects with the new JWT.
+     *
+     * @param serverUrl  Same server URL used in connect()
+     * @param newJwt     Freshly minted JWT from your backend
+     * @param callback   ConnectCallback fired when reconnection completes
+     */
+    fun updateToken(serverUrl: String, newJwt: String, callback: ConnectCallback) {
+        val uid = userId ?: run {
+            callback.onFailed(com.smartwalkie.voicepingsdk.exception.VoicePingException(
+                "Not connected", com.smartwalkie.voicepingsdk.exception.ErrorCode.CONNECTION_FAILURE))
+            return
+        }
+        connection.disconnect(object : DisconnectCallback { override fun onDisconnected() {} })
+        connect(serverUrl, newJwt, uid, callback)
+    }
+
+    /**
+     * Connect to server (legacy company-prefix mode).
+     * Token sent as "{company}_{userId}". Use JWT overload for new integrations.
+     *
+     * @param userId   User ID or Username
+     * @param company  Company/tenant prefix
+     * @param callback Callback
+     */
+    @Deprecated("Use JWT overload: connect(serverUrl, jwt, userId, callback)")
+    fun connect(userId: String, company: String, callback: ConnectCallback) {
+        this.userId = userId
+        this.company = company
+        this.jwtToken = null
+        val deviceId =
+            "${Build.MANUFACTURER}_${Build.MODEL}_${Build.FINGERPRINT}_${Build.BOOTLOADER}_${Build.DISPLAY}_${Build.HOST}"
+        player.setServerUrl(DEFAULT_SERVER_URL)
+        connection.connect(DEFAULT_SERVER_URL, getFullUserId(), deviceId, callback)
         recorder.setUserId(getFullUserId())
     }
 
@@ -250,11 +282,7 @@ object VoicePing {
         player.unmuteAll()
     }
 
-    private fun getFullUserId(): String {
-        return "${company}_$userId"
-    }
+    private fun getFullUserId(): String = company?.let { "${it}_$userId" } ?: userId!!
 
-    private fun getFullId(id: String): String {
-        return "${company}_$id"
-    }
+    private fun getFullId(id: String): String = company?.let { "${it}_$id" } ?: id
 }
