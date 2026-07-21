@@ -4,6 +4,7 @@ import com.smartwalkie.voicepingsdk.callback.ConnectCallback
 import com.smartwalkie.voicepingsdk.callback.DisconnectCallback
 import com.smartwalkie.voicepingsdk.listener.ConnectionStateListener
 import com.smartwalkie.voicepingsdk.listener.OutgoingAudioListener
+import com.smartwalkie.voicepingsdk.listener.PresenceListener
 
 /**
  * Created by kukuhsain on 02/03/18.
@@ -13,6 +14,8 @@ internal interface Connection {
     fun setConnectionStateListener(listener: ConnectionStateListener?)
 
     fun setOutgoingAudioListener(listener: OutgoingAudioListener?)
+
+    fun setPresenceListener(listener: PresenceListener?)
 
     val serverUrl: String?
 

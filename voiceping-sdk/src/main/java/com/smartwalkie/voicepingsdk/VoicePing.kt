@@ -8,6 +8,7 @@ import com.smartwalkie.voicepingsdk.callback.DisconnectCallback
 import com.smartwalkie.voicepingsdk.listener.ConnectionStateListener
 import com.smartwalkie.voicepingsdk.listener.IncomingTalkListener
 import com.smartwalkie.voicepingsdk.listener.OutgoingTalkCallback
+import com.smartwalkie.voicepingsdk.listener.PresenceListener
 import com.smartwalkie.voicepingsdk.model.AudioParam
 
 /**
@@ -134,12 +135,77 @@ object VoicePing {
     }
 
     /**
-     * Set ConnectionStateListener to VoicePing
+     * Set ConnectionStateListener to VoicePing.
+     *
+     * IMPORTANT: onConnectionStateChanged(CONNECTED) fires on every reconnect,
+     * not only after the initial connect(). Router drops all channel SUBSCRIBEs
+     * on socket disconnect (identity channel is auto-re-entered by router within
+     * a 20s grace window). Re-run your subscribe/enter loop on every CONNECTED
+     * transition or presence and audio fanout will silently break.
      *
      * @param listener ConnectionStateListener
      */
     fun setConnectionStateListener(listener: ConnectionStateListener?) {
         connection.setConnectionStateListener(listener)
+    }
+
+    /**
+     * Register a PresenceListener. Callbacks fire on the main thread.
+     * `onPresenceSync` fires once per subscribeChannel() call as initial roster.
+     * enter/leave/update fire as deltas.
+     */
+    fun setPresenceListener(listener: PresenceListener?) {
+        connection.setPresenceListener(listener)
+    }
+
+    /**
+     * Subscribe to a presence channel. REQUIRED to receive audio on that channel
+     * (site: or dm:) and required to see presence deltas (user: for DM peer status).
+     * Channel string flows verbatim — no company_ prefix.
+     */
+    fun subscribeChannel(channel: String) {
+        val uid = userId ?: return
+        connection.send(MessageHelper.createSubscribeChannelMessage(uid, channel))
+    }
+
+    /**
+     * Unsubscribe from a presence channel. Stops audio + presence delivery.
+     */
+    fun unsubscribeChannel(channel: String) {
+        val uid = userId ?: return
+        connection.send(MessageHelper.createUnsubscribeChannelMessage(uid, channel))
+    }
+
+    /**
+     * Announce self as present on a channel with optional data payload (≤256B).
+     * Do NOT call for `user:<self>` — router auto-ENTERs identity on connect.
+     */
+    fun enterChannel(channel: String, data: String = "") {
+        val uid = userId ?: return
+        connection.send(MessageHelper.createEnterMessage(uid, channel, data))
+    }
+
+    /**
+     * Remove self presence from a channel. Refuses to LEAVE the identity channel
+     * to prevent accidental self-offline (router manages user:<self> lifecycle).
+     */
+    fun leaveChannel(channel: String) {
+        val uid = userId ?: return
+        if (channel == "user:$uid") {
+            android.util.Log.w("VoicePing", "Refusing to LEAVE identity channel user:$uid")
+            return
+        }
+        connection.send(MessageHelper.createLeaveMessage(uid, channel))
+    }
+
+    /**
+     * Update own presence data on a channel. Rate-limited server-side to 10/s per uid;
+     * over-limit UPDATEs are silently dropped by router. Batch UI state changes.
+     * @param data JSON string, ≤256B (router truncates past cap)
+     */
+    fun updatePresence(channel: String, data: String) {
+        val uid = userId ?: return
+        connection.send(MessageHelper.createUpdateMessage(uid, channel, data))
     }
 
     /**

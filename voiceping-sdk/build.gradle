@@ -44,8 +44,8 @@ afterEvaluate {
             release(MavenPublication) {
                 from components.release
                 groupId = 'com.smartwalkie'
-                artifactId = 'voiceping-sdk'
-                version = '1.0.1'
+                artifactId = 'voiceping-android-sdk'
+                version = '1.0.3-SNAPSHOT'
             }
         }
     }

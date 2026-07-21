@@ -101,6 +101,8 @@ class MessageHelper {
                 } else if (message.getMessageType() == MessageType.DUPLICATE_CONNECT) {
                     message.setContent(unpacker.readString());
                     Log.d(TAG, "message type: DUPLICATED_LOGIN, content: " + message.getContent());
+                } else if (message.getMessageType() == MessageType.PRESENCE) {
+                    message.setContent(unpacker.readString());
                 }
 
                 unpacker.readArrayEnd();
@@ -335,6 +337,46 @@ class MessageHelper {
             e.printStackTrace();
         }
 
+        return out.toByteArray();
+    }
+
+    // ---- Presence-channel primitives (router protocol v2) ----
+    // All use channelType=PRIVATE(1), 5-field array: [channelType, msgType, fromId, toId, payload]
+
+    public static byte[] createSubscribeChannelMessage(String senderId, String channel) {
+        return createPresenceFrame(MessageType.SUBSCRIBE, senderId, channel, "");
+    }
+
+    public static byte[] createUnsubscribeChannelMessage(String senderId, String channel) {
+        return createPresenceFrame(MessageType.UNSUBSCRIBE, senderId, channel, "");
+    }
+
+    public static byte[] createEnterMessage(String senderId, String channel, String jsonData) {
+        return createPresenceFrame(MessageType.ENTER, senderId, channel, jsonData == null ? "" : jsonData);
+    }
+
+    public static byte[] createLeaveMessage(String senderId, String channel) {
+        return createPresenceFrame(MessageType.LEAVE, senderId, channel, "");
+    }
+
+    public static byte[] createUpdateMessage(String senderId, String channel, String jsonData) {
+        return createPresenceFrame(MessageType.UPDATE, senderId, channel, jsonData == null ? "" : jsonData);
+    }
+
+    private static byte[] createPresenceFrame(int msgType, String senderId, String channel, String payload) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        Packer packer = mMessagePack.createPacker(out);
+        try {
+            packer.writeArrayBegin(5);
+            packer.write(ChannelType.PRIVATE);
+            packer.write(msgType);
+            packer.write(senderId);
+            packer.write(channel);
+            packer.write(payload);
+            packer.writeArrayEnd(true);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
         return out.toByteArray();
     }
 

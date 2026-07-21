@@ -25,6 +25,12 @@ object MessageType {
     const val MESSAGE_READ = 21
     const val ACK_TEXT = 22
     const val UNAUTHORIZED_GROUP = 27
+    const val SUBSCRIBE = 28
+    const val UNSUBSCRIBE = 29
+    const val ENTER = 30
+    const val LEAVE = 31
+    const val UPDATE = 32
+    const val PRESENCE = 33
 
     @JvmStatic
     fun getText(messageType: Int): String {
@@ -52,6 +58,12 @@ object MessageType {
             MESSAGE_READ -> "MESSAGE_READ"
             ACK_TEXT -> "ACK_TEXT"
             UNAUTHORIZED_GROUP -> "UNAUTHORIZED_GROUP"
+            SUBSCRIBE -> "SUBSCRIBE"
+            UNSUBSCRIBE -> "UNSUBSCRIBE"
+            ENTER -> "ENTER"
+            LEAVE -> "LEAVE"
+            UPDATE -> "UPDATE"
+            PRESENCE -> "PRESENCE"
             else -> "UNKNOWN"
         }
     }

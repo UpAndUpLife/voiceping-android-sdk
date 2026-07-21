@@ -13,6 +13,14 @@ import com.smartwalkie.voicepingsdk.exception.VoicePingException;
 import com.smartwalkie.voicepingsdk.listener.ConnectionStateListener;
 import com.smartwalkie.voicepingsdk.listener.IncomingAudioListener;
 import com.smartwalkie.voicepingsdk.listener.OutgoingAudioListener;
+import com.smartwalkie.voicepingsdk.listener.PresenceListener;
+import com.smartwalkie.voicepingsdk.listener.PresenceMember;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.List;
 import com.smartwalkie.voicepingsdk.model.ChannelType;
 import com.smartwalkie.voicepingsdk.model.Message;
 import com.smartwalkie.voicepingsdk.model.MessageType;
@@ -57,6 +65,7 @@ class OkConnection implements Connection {
     private DisconnectCallback mDisconnectCallback;
     private IncomingAudioListener mIncomingAudioListener;
     private OutgoingAudioListener mOutgoingAudioListener;
+    private PresenceListener mPresenceListener;
     private ConnectionStateListener mConnectionStateListener;
     private volatile ConnectionState mConnectionState = ConnectionState.DISCONNECTED;
     private volatile boolean mIsReconnecting;
@@ -123,6 +132,9 @@ class OkConnection implements Connection {
                         }
                         if (mOutgoingAudioListener != null && isOutgoingMessageType(message.getMessageType())) {
                             mOutgoingAudioListener.onMessageReceived(message);
+                        }
+                        if (message.getMessageType() == MessageType.PRESENCE) {
+                            dispatchPresence(message);
                         }
                         return true;
                     case FAILURE:
@@ -221,6 +233,45 @@ class OkConnection implements Connection {
     @Override
     public void setOutgoingAudioListener(OutgoingAudioListener listener) {
         mOutgoingAudioListener = listener;
+    }
+
+    @Override
+    public void setPresenceListener(@Nullable PresenceListener listener) {
+        mPresenceListener = listener;
+    }
+
+    private void dispatchPresence(Message message) {
+        PresenceListener listener = mPresenceListener;
+        if (listener == null) return;
+        String channel = message.getReceiverId();
+        String json = message.getContent();
+        if (channel == null || json == null || json.isEmpty()) return;
+        try {
+            JSONObject obj = new JSONObject(json);
+            String event = obj.optString("event", "");
+            if ("sync".equals(event)) {
+                JSONArray arr = obj.optJSONArray("members");
+                List<PresenceMember> list = new ArrayList<>();
+                if (arr != null) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject m = arr.getJSONObject(i);
+                        list.add(new PresenceMember(m.optString("clientId"), m.optString("data")));
+                    }
+                }
+                mMainHandler.post(() -> listener.onPresenceSync(channel, list));
+            } else {
+                JSONObject m = obj.optJSONObject("member");
+                if (m == null) return;
+                PresenceMember member = new PresenceMember(m.optString("clientId"), m.optString("data"));
+                switch (event) {
+                    case "enter":  mMainHandler.post(() -> listener.onPresenceEnter(channel, member)); break;
+                    case "leave":  mMainHandler.post(() -> listener.onPresenceLeave(channel, member)); break;
+                    case "update": mMainHandler.post(() -> listener.onPresenceUpdate(channel, member)); break;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "PRESENCE parse failed: " + e.getMessage());
+        }
     }
 
     @Override
