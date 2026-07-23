@@ -36,6 +36,11 @@ class VoicePingButton @JvmOverloads constructor(
     var channelType: Int = 0
     private var buttonEnabled: Boolean = true
 
+    // Debounce guards against accidental rapid presses that would trip the
+    // router's per-client burst rate-limit.
+    private var lastStartAtMs: Long = 0L
+    private val minStartIntervalMs: Long = 500L
+
     init {
         inflate(context, R.layout.view_voice_ping_button, this)
         layoutVpButton = findViewById(R.id.layout_vp_button)
@@ -65,6 +70,11 @@ class VoicePingButton @JvmOverloads constructor(
             MotionEvent.ACTION_DOWN -> {
                 // PTT button pressed
                 if (isValid) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastStartAtMs < minStartIntervalMs) {
+                        return true
+                    }
+                    lastStartAtMs = now
                     layoutVpButton.setBackgroundResource(R.drawable.bg_rounded_yellow)
                     VoicePing.startTalking(targetId, channelType, this)
                     listener?.onStarted()

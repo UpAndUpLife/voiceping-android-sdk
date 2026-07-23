@@ -15,12 +15,16 @@ import com.smartwalkie.voicepingsdk.listener.IncomingAudioListener;
 import com.smartwalkie.voicepingsdk.listener.OutgoingAudioListener;
 import com.smartwalkie.voicepingsdk.listener.PresenceListener;
 import com.smartwalkie.voicepingsdk.listener.PresenceMember;
+import com.smartwalkie.voicepingsdk.listener.TokenCallback;
+import com.smartwalkie.voicepingsdk.listener.TokenProvider;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import com.smartwalkie.voicepingsdk.model.ChannelType;
 import com.smartwalkie.voicepingsdk.model.Message;
 import com.smartwalkie.voicepingsdk.model.MessageType;
@@ -38,6 +42,10 @@ import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.X509TrustManager;
 
+import java.net.CookieManager;
+import java.net.CookiePolicy;
+
+import okhttp3.JavaNetCookieJar;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
@@ -47,6 +55,13 @@ import okio.ByteString;
 
 class OkConnection implements Connection {
     private final String TAG = OkConnection.class.getSimpleName();
+
+    // Process-lifetime cookie jar. Traefik sticky cookie (vp_node) must survive
+    // reconnects so the LB pins to the same node → hits local subscription map
+    // fast path for session restore. Cross-process persistence not needed;
+    // Redis-backed restore covers cold start.
+    private static final CookieManager COOKIE_MANAGER =
+            new CookieManager(null, CookiePolicy.ACCEPT_ALL);
     private final int CONNECTED = 100;
     private final int DISCONNECTED = 200;
     private final int MESSAGE = 300;
@@ -70,6 +85,29 @@ class OkConnection implements Connection {
     private volatile ConnectionState mConnectionState = ConnectionState.DISCONNECTED;
     private volatile boolean mIsReconnecting;
 
+    private static final long RECONNECT_BASE_MS = 1000L;
+    private static final long RECONNECT_MAX_MS = 30_000L;
+    private static final double RECONNECT_JITTER = 0.3;
+    private int mReconnectAttempt;
+    private final SecureRandom mReconnectRandom = new SecureRandom();
+
+    // Session key -> last AUDIO arrival ms. Used to flag inter-arrival gaps.
+    private final Map<String, Long> mLastAudioArrivalMs = new HashMap<>();
+    // Frame period ~60ms (16kHz / 960 samples). 500ms = ~8 frames missing,
+    // well above normal mobile WS jitter — signals real drop, not RTT noise.
+    private static final long AUDIO_GAP_THRESHOLD_MS = 500L;
+
+    // Drop outgoing AUDIO frames when OkHttp WS send queue exceeds this many
+    // bytes. Router applies its own backpressure; buffering locally past this
+    // just adds latency without helping.
+    private static final long SEND_QUEUE_DROP_THRESHOLD_BYTES = 256 * 1024L;
+    private volatile long mDroppedFrameCount;
+
+    private volatile TokenProvider mTokenProvider;
+    // True while awaiting a fresh JWT — suppresses backoff-driven reconnects.
+    private volatile boolean mAwaitingToken;
+    private volatile Runnable mOnConnectedHook;
+
     OkConnection(Context context, IncomingAudioListener listener, Looper backgroundLooper) {
         mContext = context;
         mIncomingAudioListener = listener;
@@ -81,7 +119,10 @@ class OkConnection implements Connection {
                 switch (msg.what) {
                     case CONNECTED:
                         updateConnectionState(ConnectionState.CONNECTED);
+                        resetReconnectBackoff();
                         send(MessageHelper.createConnectionMessage(mUserId));
+                        Runnable hook = mOnConnectedHook;
+                        if (hook != null) hook.run();
                         Message dummyAckStart = MessageHelper.createAckStartMessage(mUserId, "00000", ChannelType.PRIVATE, System.currentTimeMillis());
                         if (dummyAckStart != null) {
                             send(dummyAckStart.getPayload());
@@ -128,6 +169,7 @@ class OkConnection implements Connection {
                             });
                         }
                         if (mIncomingAudioListener != null && isIncomingMessageType(message.getMessageType())) {
+                            checkAudioGap(message);
                             mIncomingAudioListener.onMessageReceived(message);
                         }
                         if (mOutgoingAudioListener != null && isOutgoingMessageType(message.getMessageType())) {
@@ -173,7 +215,8 @@ class OkConnection implements Connection {
         OkHttpClient.Builder clientBuilder = new OkHttpClient.Builder()
                 .readTimeout(5, TimeUnit.SECONDS)
                 .pingInterval(30, TimeUnit.SECONDS)
-                .retryOnConnectionFailure(true);
+                .retryOnConnectionFailure(true)
+                .cookieJar(new JavaNetCookieJar(COOKIE_MANAGER));
         if (serverUrl != null && serverUrl.startsWith("wss:")) {
             try {
                 SSLContext sslContext = SSLContext.getInstance("TLS");
@@ -210,6 +253,27 @@ class OkConnection implements Connection {
         return clientBuilder.build();
     }
 
+    private void checkAudioGap(Message message) {
+        int type = message.getMessageType();
+        String sender = message.getSenderId();
+        if (sender == null) return;
+        String key = message.getChannelType() + ":" + sender;
+        long now = System.currentTimeMillis();
+        if (type == MessageType.START_TALKING) {
+            mLastAudioArrivalMs.put(key, now);
+        } else if (type == MessageType.STOP_TALKING) {
+            mLastAudioArrivalMs.remove(key);
+        } else if (type == MessageType.AUDIO) {
+            Long last = mLastAudioArrivalMs.put(key, now);
+            if (last != null) {
+                long gap = now - last;
+                if (gap > AUDIO_GAP_THRESHOLD_MS && mIncomingAudioListener != null) {
+                    mIncomingAudioListener.onAudioGapDetected(sender, message.getChannelType(), gap);
+                }
+            }
+        }
+    }
+
     private boolean isIncomingMessageType(int messageType) {
         return messageType == MessageType.START_TALKING
                 || messageType == MessageType.AUDIO
@@ -238,6 +302,16 @@ class OkConnection implements Connection {
     @Override
     public void setPresenceListener(@Nullable PresenceListener listener) {
         mPresenceListener = listener;
+    }
+
+    @Override
+    public void setTokenProvider(@Nullable TokenProvider provider) {
+        mTokenProvider = provider;
+    }
+
+    @Override
+    public void setOnConnectedHook(@Nullable Runnable hook) {
+        mOnConnectedHook = hook;
     }
 
     private void dispatchPresence(Message message) {
@@ -326,20 +400,70 @@ class OkConnection implements Connection {
     }
 
     private void reconnectWithDelay() {
+        if (mAwaitingToken) {
+            Log.d(TAG, "reconnect suppressed: awaiting fresh JWT");
+            return;
+        }
         updateConnectionState(ConnectionState.CONNECTING);
-        if (!mIsReconnecting) {
-            Timer timer = new Timer();
-            timer.schedule(new TimerTask() {
-                @Override
-                public void run() {
-                    mIsReconnecting = false;
-                    if (mConnectionState == ConnectionState.CONNECTING) {
+        if (mIsReconnecting) return;
+        mIsReconnecting = true;
+        long delay = nextReconnectDelayMs();
+        Log.d(TAG, "reconnect scheduled in " + delay + "ms (attempt=" + mReconnectAttempt + ")");
+        Timer timer = new Timer();
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                mIsReconnecting = false;
+                if (mConnectionState == ConnectionState.CONNECTING) {
+                    connect();
+                }
+            }
+        }, delay);
+    }
+
+    private long nextReconnectDelayMs() {
+        long exp = RECONNECT_BASE_MS << Math.min(mReconnectAttempt, 5);
+        long capped = Math.min(exp, RECONNECT_MAX_MS);
+        double jitter = 1.0 + (mReconnectRandom.nextDouble() * 2 - 1) * RECONNECT_JITTER;
+        mReconnectAttempt++;
+        return Math.max(RECONNECT_BASE_MS, (long) (capped * jitter));
+    }
+
+    private void resetReconnectBackoff() {
+        mReconnectAttempt = 0;
+    }
+
+    private void handleTokenExpired() {
+        TokenProvider provider = mTokenProvider;
+        if (provider == null) {
+            mBackgroundHandler.sendEmptyMessage(FAILURE);
+            return;
+        }
+        Log.d(TAG, "TokenExpired: requesting fresh JWT");
+        mAwaitingToken = true;
+        updateConnectionState(ConnectionState.CONNECTING);
+        provider.onTokenExpired(new TokenCallback() {
+            @Override
+            public void onToken(@NotNull String jwt) {
+                mAwaitingToken = false;
+                mUserId = jwt;
+                resetReconnectBackoff();
+                Log.d(TAG, "TokenExpired: got fresh JWT, reconnecting");
+                mBackgroundHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
                         connect();
                     }
-                }
-            }, 5000);
-        }
-        mIsReconnecting = true;
+                });
+            }
+
+            @Override
+            public void onError(@NotNull Throwable e) {
+                mAwaitingToken = false;
+                Log.w(TAG, "TokenExpired: refresh failed, falling back to backoff: " + e.getMessage());
+                mBackgroundHandler.sendEmptyMessage(FAILURE);
+            }
+        });
     }
 
     @Override
@@ -348,7 +472,15 @@ class OkConnection implements Connection {
             mDisconnectCallback = callback;
         }
         Log.d(TAG, "close WebSocket...");
-        if (mWebSocket != null) mWebSocket.cancel();
+        resetReconnectBackoff();
+        if (mWebSocket != null) {
+            // Graceful close: flushes enqueued frames (LEAVE/UNSUBSCRIBE) and
+            // sends a close frame before tearing down. cancel() would discard
+            // the write queue, causing router to fall back to grace TTL for
+            // presence updates when the app is torn down while radio is cold.
+            boolean closing = mWebSocket.close(1000, "client_shutdown");
+            if (!closing) mWebSocket.cancel();
+        }
         updateConnectionState(ConnectionState.DISCONNECTED);
         if (mDisconnectCallback != null) {
             mDisconnectCallback.onDisconnected();
@@ -364,7 +496,16 @@ class OkConnection implements Connection {
             }
             return;
         }
-        if (mWebSocket != null) mWebSocket.send(ByteString.of(data));
+        if (mWebSocket == null) return;
+        if (mWebSocket.queueSize() > SEND_QUEUE_DROP_THRESHOLD_BYTES) {
+            mDroppedFrameCount++;
+            if ((mDroppedFrameCount & 0x1F) == 0) {
+                Log.w(TAG, "send backpressure: dropped " + mDroppedFrameCount
+                        + " frames, queueSize=" + mWebSocket.queueSize());
+            }
+            return;
+        }
+        mWebSocket.send(ByteString.of(data));
     }
 
     private class SocketListener extends WebSocketListener {
@@ -399,6 +540,12 @@ class OkConnection implements Connection {
             Log.d(TAG, "WebSocket onFailure, error: " + t.getMessage());
             t.printStackTrace();
             if (response != null) Log.d(TAG, response.toString());
+            if (response != null && response.code() == 401
+                    && "TokenExpired".equalsIgnoreCase(response.message())
+                    && mTokenProvider != null) {
+                handleTokenExpired();
+                return;
+            }
             mBackgroundHandler.sendEmptyMessage(FAILURE);
         }
     }

@@ -5,6 +5,7 @@ import com.smartwalkie.voicepingsdk.callback.DisconnectCallback
 import com.smartwalkie.voicepingsdk.listener.ConnectionStateListener
 import com.smartwalkie.voicepingsdk.listener.OutgoingAudioListener
 import com.smartwalkie.voicepingsdk.listener.PresenceListener
+import com.smartwalkie.voicepingsdk.listener.TokenProvider
 
 /**
  * Created by kukuhsain on 02/03/18.
@@ -16,6 +17,11 @@ internal interface Connection {
     fun setOutgoingAudioListener(listener: OutgoingAudioListener?)
 
     fun setPresenceListener(listener: PresenceListener?)
+
+    fun setTokenProvider(provider: TokenProvider?)
+
+    /** Called on every CONNECTED transition (initial + reconnects). */
+    fun setOnConnectedHook(hook: Runnable?)
 
     val serverUrl: String?
 

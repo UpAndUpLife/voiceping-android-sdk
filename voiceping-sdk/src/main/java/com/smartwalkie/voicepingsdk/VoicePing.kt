@@ -3,12 +3,14 @@ package com.smartwalkie.voicepingsdk
 import android.content.Context
 import android.os.Build
 import android.os.HandlerThread
+import java.security.MessageDigest
 import com.smartwalkie.voicepingsdk.callback.ConnectCallback
 import com.smartwalkie.voicepingsdk.callback.DisconnectCallback
 import com.smartwalkie.voicepingsdk.listener.ConnectionStateListener
 import com.smartwalkie.voicepingsdk.listener.IncomingTalkListener
 import com.smartwalkie.voicepingsdk.listener.OutgoingTalkCallback
 import com.smartwalkie.voicepingsdk.listener.PresenceListener
+import com.smartwalkie.voicepingsdk.listener.TokenProvider
 import com.smartwalkie.voicepingsdk.model.AudioParam
 
 /**
@@ -25,6 +27,27 @@ object VoicePing {
     private var company: String? = null
     // Non-null when connected via JWT overload; null in legacy company-prefix mode
     private var jwtToken: String? = null
+
+    // Channels the app has subscribed to via subscribeChannel(). Replayed
+    // automatically on every CONNECTED transition so reconnects (backoff-
+    // driven or post-TokenExpired) restore audio + presence fanout without
+    // app intervention. Router-side session-restore within grace makes the
+    // replay idempotent; outside grace it is the only path back.
+    private val activeChannels = linkedSetOf<String>()
+
+    /**
+     * Stable per-install device identifier used by the SDK for the WS `DeviceId`
+     * header. Session-restore on the router keys by this value, so callers MUST
+     * pass the same string when minting the JWT (POST /ptt/token body.deviceId).
+     * SHA-256 hex of Build.MANUFACTURER + MODEL + FINGERPRINT — no permissions,
+     * fixed 64-char length, no build-info leakage in logs / server keys.
+     */
+    val deviceId: String by lazy {
+        val raw = "${Build.MANUFACTURER}_${Build.MODEL}_${Build.FINGERPRINT}"
+        MessageDigest.getInstance("SHA-256")
+            .digest(raw.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+    }
 
     /**
      * Initialize VoicePing. This process should be done in onCreate of your Application class
@@ -49,6 +72,7 @@ object VoicePing {
         connection = OkConnection(context, player, voicePingThread.looper)
         recorder = Recorder(context, connection, audioParam, voicePingThread.looper)
         connection.setOutgoingAudioListener(recorder)
+        connection.setOnConnectedHook(Runnable { replayActiveChannels() })
     }
 
     /**
@@ -69,8 +93,6 @@ object VoicePing {
         this.userId = userId
         this.company = null
         this.jwtToken = jwt
-        val deviceId =
-            "${Build.MANUFACTURER}_${Build.MODEL}_${Build.FINGERPRINT}_${Build.BOOTLOADER}_${Build.DISPLAY}_${Build.HOST}"
         player.setServerUrl(realServerUrl)
         connection.connect(realServerUrl, jwt, deviceId, callback)
         recorder.setUserId(userId)
@@ -108,8 +130,6 @@ object VoicePing {
         this.userId = userId
         this.company = company
         this.jwtToken = null
-        val deviceId =
-            "${Build.MANUFACTURER}_${Build.MODEL}_${Build.FINGERPRINT}_${Build.BOOTLOADER}_${Build.DISPLAY}_${Build.HOST}"
         player.setServerUrl(DEFAULT_SERVER_URL)
         connection.connect(DEFAULT_SERVER_URL, getFullUserId(), deviceId, callback)
         recorder.setUserId(getFullUserId())
@@ -122,6 +142,7 @@ object VoicePing {
      * @param callback Callback
      */
     fun disconnect(callback: DisconnectCallback) {
+        synchronized(activeChannels) { activeChannels.clear() }
         connection.disconnect(callback)
     }
 
@@ -159,12 +180,27 @@ object VoicePing {
     }
 
     /**
+     * Supply a TokenProvider so the SDK can transparently recover from expired
+     * JWTs. When the router rejects the socket with HTTP 401 "TokenExpired",
+     * the SDK invokes provider.onTokenExpired(callback); reply with a fresh
+     * JWT via callback.onToken(jwt) or callback.onError(e).
+     *
+     * While awaiting the fresh token, reconnect backoff is paused. On error,
+     * the SDK resumes normal backoff — do not retry-loop the mint call
+     * from the provider itself.
+     */
+    fun setTokenProvider(provider: TokenProvider?) {
+        connection.setTokenProvider(provider)
+    }
+
+    /**
      * Subscribe to a presence channel. REQUIRED to receive audio on that channel
      * (site: or dm:) and required to see presence deltas (user: for DM peer status).
      * Channel string flows verbatim — no company_ prefix.
      */
     fun subscribeChannel(channel: String) {
         val uid = userId ?: return
+        synchronized(activeChannels) { activeChannels.add(channel) }
         connection.send(MessageHelper.createSubscribeChannelMessage(uid, channel))
     }
 
@@ -173,7 +209,16 @@ object VoicePing {
      */
     fun unsubscribeChannel(channel: String) {
         val uid = userId ?: return
+        synchronized(activeChannels) { activeChannels.remove(channel) }
         connection.send(MessageHelper.createUnsubscribeChannelMessage(uid, channel))
+    }
+
+    private fun replayActiveChannels() {
+        val uid = userId ?: return
+        val snapshot = synchronized(activeChannels) { activeChannels.toList() }
+        for (channel in snapshot) {
+            connection.send(MessageHelper.createSubscribeChannelMessage(uid, channel))
+        }
     }
 
     /**
