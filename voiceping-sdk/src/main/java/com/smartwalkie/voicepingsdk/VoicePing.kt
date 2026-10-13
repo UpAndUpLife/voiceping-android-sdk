@@ -18,27 +18,24 @@ import com.smartwalkie.voicepingsdk.model.AudioParam
  */
 object VoicePing {
     private const val DEFAULT_SERVER_URL: String = "wss://router-lite.voiceping.info"
+    private const val MAX_PEOPLE_IDS = 1000
     private lateinit var audioParam: AudioParam
     private lateinit var player: Player
     private lateinit var connection: Connection
     private lateinit var recorder: Recorder
 
     private var userId: String? = null
-    private var company: String? = null
-    // Non-null when connected via JWT overload; null in legacy company-prefix mode
-    private var jwtToken: String? = null
 
-    // Channels the app has subscribed to via subscribeChannel(). Replayed
-    // automatically on every CONNECTED transition so reconnects (backoff-
-    // driven or post-TokenExpired) restore audio + presence fanout without
-    // app intervention. Router-side session-restore within grace makes the
-    // replay idempotent; outside grace it is the only path back.
-    private val activeChannels = linkedSetOf<String>()
+    // Sites the app listens to via subscribeSite() and the last peopleSub() request. Both are
+    // re-sent on every CONNECTED transition: the router keeps neither across a socket.
+    private val activeSites = linkedSetOf<String>()
+    private var lastPeopleIds: List<String>? = null
+    private var lastPeopleSites: Map<String, String> = emptyMap()
 
     /**
-     * Stable per-install device identifier used by the SDK for the WS `DeviceId`
-     * header. Session-restore on the router keys by this value, so callers MUST
-     * pass the same string when minting the JWT (POST /ptt/token body.deviceId).
+     * Stable per-install device identifier. The router replaces a socket quietly when the
+     * new one carries the same deviceId, so callers MUST pass this string when minting
+     * the JWT (POST /ptt/token body.deviceId).
      * SHA-256 hex of Build.MANUFACTURER + MODEL + FINGERPRINT — no permissions,
      * fixed 64-char length, no build-info leakage in logs / server keys.
      */
@@ -72,16 +69,16 @@ object VoicePing {
         connection = OkConnection(context, player, voicePingThread.looper)
         recorder = Recorder(context, connection, audioParam, voicePingThread.looper)
         connection.setOutgoingAudioListener(recorder)
-        connection.setOnConnectedHook(Runnable { replayActiveChannels() })
+        connection.setOnConnectedHook(Runnable { replaySubscriptions() })
     }
 
     /**
-     * Connect using a backend-minted JWT. Channel and user IDs are sent verbatim (no prefix).
-     * The router authenticates via the JWT passed as the VoicePingToken header.
+     * Connect using a backend-minted identity token (12 h JWT {uid, deviceId, iat, exp}).
+     * The router authenticates via the JWT sent in the `token` header.
      *
      * @param serverUrl Server WebSocket URL (e.g. from BuildConfig.PTT_ROUTER_URL)
      * @param jwt       HS256 JWT minted by your backend
-     * @param userId    User ID as known to your backend (stored for startTalking/joinGroup)
+     * @param userId    User ID as known to your backend (the JWT uid); used as sender of talks
      * @param callback  ConnectCallback
      */
     fun connect(serverUrl: String, jwt: String, userId: String, callback: ConnectCallback) {
@@ -91,48 +88,21 @@ object VoicePing {
             else -> serverUrl
         }
         this.userId = userId
-        this.company = null
-        this.jwtToken = jwt
         player.setServerUrl(realServerUrl)
-        connection.connect(realServerUrl, jwt, deviceId, callback)
         recorder.setUserId(userId)
+        connection.connect(realServerUrl, jwt, callback)
     }
 
     /**
-     * Refresh the JWT without a full disconnect/reconnect cycle visible to the user.
-     * Call this before your token expires (backend rotates every 30 min).
-     * Simple impl: disconnects and reconnects with the new JWT.
+     * Replace the token and reconnect once with it. Use after a re-login, or to refresh
+     * ahead of expiry. Reconnecting also restores a connection stopped by an error such as
+     * ErrorCode.UNAUTHORIZED. Subscriptions are re-sent after the socket opens.
+     * For the expiry the router reports on connect, set a TokenProvider instead.
      *
-     * @param serverUrl  Same server URL used in connect()
-     * @param newJwt     Freshly minted JWT from your backend
-     * @param callback   ConnectCallback fired when reconnection completes
+     * @param newJwt Freshly minted JWT from your backend (same uid and deviceId)
      */
-    fun updateToken(serverUrl: String, newJwt: String, callback: ConnectCallback) {
-        val uid = userId ?: run {
-            callback.onFailed(com.smartwalkie.voicepingsdk.exception.VoicePingException(
-                "Not connected", com.smartwalkie.voicepingsdk.exception.ErrorCode.CONNECTION_FAILURE))
-            return
-        }
-        connection.disconnect(object : DisconnectCallback { override fun onDisconnected() {} })
-        connect(serverUrl, newJwt, uid, callback)
-    }
-
-    /**
-     * Connect to server (legacy company-prefix mode).
-     * Token sent as "{company}_{userId}". Use JWT overload for new integrations.
-     *
-     * @param userId   User ID or Username
-     * @param company  Company/tenant prefix
-     * @param callback Callback
-     */
-    @Deprecated("Use JWT overload: connect(serverUrl, jwt, userId, callback)")
-    fun connect(userId: String, company: String, callback: ConnectCallback) {
-        this.userId = userId
-        this.company = company
-        this.jwtToken = null
-        player.setServerUrl(DEFAULT_SERVER_URL)
-        connection.connect(DEFAULT_SERVER_URL, getFullUserId(), deviceId, callback)
-        recorder.setUserId(getFullUserId())
+    fun updateToken(newJwt: String) {
+        connection.updateToken(newJwt)
     }
 
     /**
@@ -142,7 +112,11 @@ object VoicePing {
      * @param callback Callback
      */
     fun disconnect(callback: DisconnectCallback) {
-        synchronized(activeChannels) { activeChannels.clear() }
+        synchronized(activeSites) {
+            activeSites.clear()
+            lastPeopleIds = null
+            lastPeopleSites = emptyMap()
+        }
         connection.disconnect(callback)
     }
 
@@ -158,11 +132,13 @@ object VoicePing {
     /**
      * Set ConnectionStateListener to VoicePing.
      *
-     * IMPORTANT: onConnectionStateChanged(CONNECTED) fires on every reconnect,
-     * not only after the initial connect(). Router drops all channel SUBSCRIBEs
-     * on socket disconnect (identity channel is auto-re-entered by router within
-     * a 20s grace window). Re-run your subscribe/enter loop on every CONNECTED
-     * transition or presence and audio fanout will silently break.
+     * onConnectionStateChanged(CONNECTED) fires on every reconnect. The SDK re-sends site
+     * subscriptions and the last peopleSub() itself.
+     *
+     * onConnectionError fires once and the SDK stops reconnecting for:
+     * ErrorCode.SESSION_TAKEN (4409, another device signed in), ErrorCode.UNAUTHORIZED
+     * (token rejected) and ErrorCode.TOKEN_EXPIRED (expired, no TokenProvider set).
+     * Sign in again, then call updateToken().
      *
      * @param listener ConnectionStateListener
      */
@@ -172,8 +148,7 @@ object VoicePing {
 
     /**
      * Register a PresenceListener. Callbacks fire on the main thread.
-     * `onPresenceSync` fires once per subscribeChannel() call as initial roster.
-     * enter/leave/update fire as deltas.
+     * Presence snapshot, presence deltas, team changed and site status events arrive here.
      */
     fun setPresenceListener(listener: PresenceListener?) {
         connection.setPresenceListener(listener)
@@ -185,72 +160,75 @@ object VoicePing {
      * the SDK invokes provider.onTokenExpired(callback); reply with a fresh
      * JWT via callback.onToken(jwt) or callback.onError(e).
      *
-     * While awaiting the fresh token, reconnect backoff is paused. On error,
-     * the SDK resumes normal backoff — do not retry-loop the mint call
-     * from the provider itself.
+     * While awaiting the fresh token, reconnecting is paused. On error, the SDK resumes
+     * the normal backoff: do not retry-loop the mint call from the provider itself.
      */
     fun setTokenProvider(provider: TokenProvider?) {
         connection.setTokenProvider(provider)
     }
 
     /**
-     * Subscribe to a presence channel. REQUIRED to receive audio on that channel
-     * (site: or dm:) and required to see presence deltas (user: for DM peer status).
-     * Channel string flows verbatim — no company_ prefix.
+     * Listen to a site: duty changes arrive as onSiteStatus, and the site's talks are heard.
+     * Re-sent automatically after every reconnect.
+     *
+     * @param siteId Bare site id (the SDK adds the "site:" prefix)
      */
-    fun subscribeChannel(channel: String) {
+    fun subscribeSite(siteId: String) {
         val uid = userId ?: return
-        synchronized(activeChannels) { activeChannels.add(channel) }
-        connection.send(MessageHelper.createSubscribeChannelMessage(uid, channel))
-    }
-
-    /**
-     * Unsubscribe from a presence channel. Stops audio + presence delivery.
-     */
-    fun unsubscribeChannel(channel: String) {
-        val uid = userId ?: return
-        synchronized(activeChannels) { activeChannels.remove(channel) }
-        connection.send(MessageHelper.createUnsubscribeChannelMessage(uid, channel))
-    }
-
-    private fun replayActiveChannels() {
-        val uid = userId ?: return
-        val snapshot = synchronized(activeChannels) { activeChannels.toList() }
-        for (channel in snapshot) {
-            connection.send(MessageHelper.createSubscribeChannelMessage(uid, channel))
+        synchronized(activeSites) { activeSites.add(siteId) }
+        if (connection.connectionState == ConnectionState.CONNECTED) {
+            connection.send(MessageHelper.createSubscribeSiteMessage(uid, siteId))
         }
     }
 
     /**
-     * Announce self as present on a channel with optional data payload (≤256B).
-     * Do NOT call for `user:<self>` — router auto-ENTERs identity on connect.
+     * Stop listening to a site.
      */
-    fun enterChannel(channel: String, data: String = "") {
+    fun unsubscribeSite(siteId: String) {
         val uid = userId ?: return
-        connection.send(MessageHelper.createEnterMessage(uid, channel, data))
-    }
-
-    /**
-     * Remove self presence from a channel. Refuses to LEAVE the identity channel
-     * to prevent accidental self-offline (router manages user:<self> lifecycle).
-     */
-    fun leaveChannel(channel: String) {
-        val uid = userId ?: return
-        if (channel == "user:$uid") {
-            android.util.Log.w("VoicePing", "Refusing to LEAVE identity channel user:$uid")
-            return
+        synchronized(activeSites) { activeSites.remove(siteId) }
+        if (connection.connectionState == ConnectionState.CONNECTED) {
+            connection.send(MessageHelper.createUnsubscribeSiteMessage(uid, siteId))
         }
-        connection.send(MessageHelper.createLeaveMessage(uid, channel))
     }
 
     /**
-     * Update own presence data on a channel. Rate-limited server-side to 10/s per uid;
-     * over-limit UPDATEs are silently dropped by router. Batch UI state changes.
-     * @param data JSON string, ≤256B (router truncates past cap)
+     * Replace the whole presence subscription. The router answers with onPresenceSnapshot
+     * (current state of every id you may see, and of each site whose duty version differs),
+     * then sends onPresence deltas. Call again with the new list after onTeamChanged and the
+     * team refetch. Re-sent automatically after every reconnect.
+     *
+     * @param ids   Person ids to watch (at most 1000; extra ids are dropped)
+     * @param sites Bare site id to the duty version the app already holds
      */
-    fun updatePresence(channel: String, data: String) {
+    fun peopleSub(ids: List<String>, sites: Map<String, String>) {
         val uid = userId ?: return
-        connection.send(MessageHelper.createUpdateMessage(uid, channel, data))
+        val limited = ids.take(MAX_PEOPLE_IDS)
+        synchronized(activeSites) {
+            lastPeopleIds = limited
+            lastPeopleSites = sites.toMap()
+        }
+        if (connection.connectionState == ConnectionState.CONNECTED) {
+            connection.send(MessageHelper.createPeopleSubMessage(uid, limited, sites))
+        }
+    }
+
+    private fun replaySubscriptions() {
+        val uid = userId ?: return
+        val sites: List<String>
+        val ids: List<String>?
+        val versions: Map<String, String>
+        synchronized(activeSites) {
+            sites = activeSites.toList()
+            ids = lastPeopleIds
+            versions = lastPeopleSites
+        }
+        for (site in sites) {
+            connection.send(MessageHelper.createSubscribeSiteMessage(uid, site))
+        }
+        if (ids != null) {
+            connection.send(MessageHelper.createPeopleSubMessage(uid, ids, versions))
+        }
     }
 
     /**
@@ -266,19 +244,19 @@ object VoicePing {
     /**
      * Start PTT Talk using VoicePing's PTT functionality.
      *
-     * @param receiverId  Receiver ID for private channel, or Group ID for group channel
+     * @param receiverId  Receiver user id for private channel, or "site:<siteId>" for a site talk
      * @param channelType ChannelType.PRIVATE or ChannelType.GROUP
      * @param callback    OutgoingTalkCallback
      */
     fun startTalking(receiverId: String, channelType: Int, callback: OutgoingTalkCallback?) {
-        recorder.startTalking(getFullId(receiverId), channelType, callback, null, null)
+        recorder.startTalking(receiverId, channelType, callback, null, null)
     }
 
     /**
      * Start PTT Talk using VoicePing's PTT functionality. Save recorded audio to the destination
      * path at the end of the talk. The saved file can be played using VoicePingPlayer.
      *
-     * @param receiverId      Receiver ID for private channel, or Group ID for group channel
+     * @param receiverId      Receiver user id for private channel, or "site:<siteId>" for a site talk
      * @param channelType     ChannelType.PRIVATE or ChannelType.GROUP
      * @param callback        OutgoingTalkCallback
      * @param destinationPath Destination path
@@ -289,7 +267,7 @@ object VoicePing {
         callback: OutgoingTalkCallback?,
         destinationPath: String?
     ) {
-        recorder.startTalking(getFullId(receiverId), channelType, callback, destinationPath, null)
+        recorder.startTalking(receiverId, channelType, callback, destinationPath, null)
     }
 
     /**
@@ -297,7 +275,7 @@ object VoicePing {
      * path at the end of the talk. The saved file can be played using VoicePingPlayer. Add custom
      * audio recorder using CustomAudioRecorder.
      *
-     * @param receiverId      Receiver ID for private channel, or Group ID for group channel
+     * @param receiverId      Receiver user id for private channel, or "site:<siteId>" for a site talk
      * @param channelType     ChannelType.PRIVATE or ChannelType.GROUP
      * @param callback        OutgoingTalkCallback
      * @param destinationPath Destination path
@@ -311,7 +289,7 @@ object VoicePing {
         recorder: CustomAudioRecorder?
     ) {
         this.recorder.startTalking(
-            getFullId(receiverId),
+            receiverId,
             channelType,
             callback,
             destinationPath,
@@ -324,24 +302,6 @@ object VoicePing {
      */
     fun stopTalking() {
         recorder.stopTalking()
-    }
-
-    /**
-     * Join a group channel.
-     *
-     * @param groupId Group ID
-     */
-    fun joinGroup(groupId: String) {
-        connection.send(MessageHelper.createSubscribeMessage(getFullUserId(), getFullId(groupId)))
-    }
-
-    /**
-     * Leave a group channel.
-     *
-     * @param groupId Group ID
-     */
-    fun leaveGroup(groupId: String) {
-        connection.send(MessageHelper.createUnsubscribeMessage(getFullUserId(), getFullId(groupId)))
     }
 
     /**
@@ -366,7 +326,7 @@ object VoicePing {
      * @param channelType ChannelType.PRIVATE or ChannelType.GROUP
      */
     fun mute(targetId: String, channelType: Int) {
-        player.mute(getFullId(targetId), channelType)
+        player.mute(targetId, channelType)
     }
 
     /**
@@ -383,7 +343,7 @@ object VoicePing {
      * @param channelType ChannelType.PRIVATE or ChannelType.GROUP
      */
     fun unmute(targetId: String, channelType: Int) {
-        player.unmute(getFullId(targetId), channelType)
+        player.unmute(targetId, channelType)
     }
 
     /**
@@ -392,8 +352,4 @@ object VoicePing {
     fun unmuteAll() {
         player.unmuteAll()
     }
-
-    private fun getFullUserId(): String = company?.let { "${it}_$userId" } ?: userId!!
-
-    private fun getFullId(id: String): String = company?.let { "${it}_$id" } ?: id
 }

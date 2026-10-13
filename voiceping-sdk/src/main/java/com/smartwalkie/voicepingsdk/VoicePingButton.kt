@@ -138,10 +138,11 @@ class VoicePingButton @JvmOverloads constructor(
 
     override fun onOutgoingTalkError(e: VoicePingException) {
         log("onOutgoingTalkError, code: ${e.errorCode}, message: ${e.message}")
-        val errorMessage = if (e.errorCode == ErrorCode.UNAUTHORIZED_GROUP) {
-            "Please join the group first before sending PTT"
-        } else {
-            e.message
+        val errorMessage = when (e.errorCode) {
+            ErrorCode.START_NOT_ALLOWED -> "You are not allowed to talk here"
+            ErrorCode.START_BUSY -> "Someone else is talking"
+            ErrorCode.START_OFFLINE -> "User is offline"
+            else -> e.message
         }
         showToast(errorMessage)
     }

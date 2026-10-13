@@ -85,7 +85,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener,
         updateConnectionState(VoicePing.getConnectionState())
         VoicePing.setConnectionStateListener(this)
         if (VoicePing.getConnectionState() == ConnectionState.DISCONNECTED) {
-            VoicePing.connect(serverUrl, userId, company, object : ConnectCallback {
+            VoicePing.connect(serverUrl, company /* JWT */, userId, object : ConnectCallback {
                 override fun onConnected() {
                     // Ignored
                 }
@@ -161,7 +161,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener,
 
     override fun onConnectionError(e: VoicePingException) {
         runOnUiThread {
-            if (e.errorCode == ErrorCode.DUPLICATE_CONNECT) {
+            if (e.errorCode == ErrorCode.SESSION_TAKEN) {
                 if (!isFinishing) {
                     VoicePing.unmuteAll()
                     MyPrefs.clear()
@@ -232,7 +232,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener,
             return
         }
         log("joinGroup, group ID: $groupId")
-        VoicePing.joinGroup(groupId)
+        VoicePing.subscribeSite(groupId)
         showToast("Joined to $groupId")
         Utils.closeKeyboard(this, currentFocus)
     }
@@ -245,7 +245,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener,
             return
         }
         log("leaveGroup, group ID: $groupId")
-        VoicePing.leaveGroup(groupId)
+        VoicePing.unsubscribeSite(groupId)
         showToast("Left from $groupId")
         Utils.closeKeyboard(this, currentFocus)
     }
