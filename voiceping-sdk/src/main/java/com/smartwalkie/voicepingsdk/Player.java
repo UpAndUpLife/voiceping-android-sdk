@@ -1,6 +1,9 @@
 package com.smartwalkie.voicepingsdk;
 
 import android.content.Context;
+import android.media.AudioAttributes;
+import android.media.AudioFocusRequest;
+import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.os.Handler;
@@ -35,6 +38,7 @@ class Player implements IncomingAudioListener {
     private String mServerUrl;
     private Opus mOpus;
     private AudioTrack mAudioTrack;
+    private AudioFocusRequest mFocusRequest;
     private final Handler mBackgroundHandler;
     private final Handler mPlayerHandler;
     private IncomingTalkListener mIncomingTalkListener;
@@ -138,8 +142,10 @@ class Player implements IncomingAudioListener {
                             mAudioTrack.stop();
                             mAudioTrack.flush();
                             mAudioTrack.release();
+                            abandonAudioFocus();
                             return true;
                         }
+                        abandonAudioFocus();
                         return false;
                 }
                 return false;
@@ -194,24 +200,47 @@ class Player implements IncomingAudioListener {
         }
     }
 
+    // Media usage routes to the loudspeaker, or to the headset when one is connected.
     private AudioTrack newAudioTrack() {
-        AudioManager am = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
-        if (am != null) {
-            am.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN);
-        }
         int minBufferSize = mAudioParam.getPlayMinBufferSize();
-//        Log.d(TAG, "init minbuffer size=" + minBufferSize);
-        int streamType = AudioManager.STREAM_MUSIC;
-        return new AudioTrack(
-                streamType,
-                mAudioParam.getSampleRate(),
-                mAudioParam.getChannelOutConfig(),
-                mAudioParam.getAudioFormat(),
-                Math.min(minBufferSize, mAudioParam.getFrameSize() * mAudioParam.getBufferSizeFactor()),
-                AudioTrack.MODE_STREAM);
+        return new AudioTrack.Builder()
+                .setAudioAttributes(new AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build())
+                .setAudioFormat(new AudioFormat.Builder()
+                        .setSampleRate(mAudioParam.getSampleRate())
+                        .setChannelMask(mAudioParam.getChannelOutConfig())
+                        .setEncoding(mAudioParam.getAudioFormat())
+                        .build())
+                .setBufferSizeInBytes(Math.min(minBufferSize, mAudioParam.getFrameSize() * mAudioParam.getBufferSizeFactor()))
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build();
+    }
+
+    // Short focus for the length of a playback burst: other audio ducks, then returns.
+    private void requestAudioFocus() {
+        AudioManager am = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
+        if (am == null) return;
+        if (mFocusRequest == null) {
+            mFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build())
+                    .build();
+        }
+        am.requestAudioFocus(mFocusRequest);
+    }
+
+    private void abandonAudioFocus() {
+        if (mFocusRequest == null) return;
+        AudioManager am = (AudioManager) mContext.getSystemService(Context.AUDIO_SERVICE);
+        if (am != null) am.abandonAudioFocusRequest(mFocusRequest);
     }
 
     private void playAudioTrack() {
+        requestAudioFocus();
         try {
             mAudioTrack.play();
         } catch (IllegalStateException e) {

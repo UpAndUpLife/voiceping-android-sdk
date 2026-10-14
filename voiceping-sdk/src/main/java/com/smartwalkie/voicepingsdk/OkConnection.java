@@ -2,6 +2,8 @@ package com.smartwalkie.voicepingsdk;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.Network;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
@@ -13,37 +15,32 @@ import com.smartwalkie.voicepingsdk.exception.VoicePingException;
 import com.smartwalkie.voicepingsdk.listener.ConnectionStateListener;
 import com.smartwalkie.voicepingsdk.listener.IncomingAudioListener;
 import com.smartwalkie.voicepingsdk.listener.OutgoingAudioListener;
+import com.smartwalkie.voicepingsdk.listener.PersonPresence;
 import com.smartwalkie.voicepingsdk.listener.PresenceListener;
-import com.smartwalkie.voicepingsdk.listener.PresenceMember;
+import com.smartwalkie.voicepingsdk.listener.ChannelVersion;
 import com.smartwalkie.voicepingsdk.listener.TokenCallback;
 import com.smartwalkie.voicepingsdk.listener.TokenProvider;
-
-import org.json.JSONArray;
-import org.json.JSONObject;
-
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import com.smartwalkie.voicepingsdk.model.ChannelType;
 import com.smartwalkie.voicepingsdk.model.Message;
 import com.smartwalkie.voicepingsdk.model.MessageType;
 
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.json.JSONArray;
+import org.json.JSONObject;
 
+import java.net.CookieManager;
+import java.net.CookiePolicy;
 import java.security.SecureRandom;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
-import java.util.Timer;
-import java.util.TimerTask;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.X509TrustManager;
-
-import java.net.CookieManager;
-import java.net.CookiePolicy;
 
 import okhttp3.JavaNetCookieJar;
 import okhttp3.OkHttpClient;
@@ -62,34 +59,59 @@ class OkConnection implements Connection {
     // Redis-backed restore covers cold start.
     private static final CookieManager COOKIE_MANAGER =
             new CookieManager(null, CookiePolicy.ACCEPT_ALL);
-    private final int CONNECTED = 100;
-    private final int DISCONNECTED = 200;
-    private final int MESSAGE = 300;
-    private final int FAILURE = 400;
+
+    // Router close codes.
+    private static final int CLOSE_NORMAL = 1000;
+    private static final int CLOSE_SESSION_TAKEN = 4409;
 
     private final Context mContext;
+    private final ConnectivityManager mConnectivityManager;
     private OkHttpClient mOkHttpClient;
-    private WebSocket mWebSocket;
     private String mServerUrl;
-    private String mUserId;
-    private String mDeviceId;
+    private String mToken;
     private final Handler mMainHandler;
+    // All connection state below is touched only on this handler's thread.
     private final Handler mBackgroundHandler;
 
+    // Current socket. Events from any other socket are stale and ignored.
+    private volatile WebSocket mWebSocket;
     private ConnectCallback mConnectCallback;
-    private DisconnectCallback mDisconnectCallback;
     private IncomingAudioListener mIncomingAudioListener;
-    private OutgoingAudioListener mOutgoingAudioListener;
-    private PresenceListener mPresenceListener;
-    private ConnectionStateListener mConnectionStateListener;
+    private volatile OutgoingAudioListener mOutgoingAudioListener;
+    private volatile PresenceListener mPresenceListener;
+    private volatile ConnectionStateListener mConnectionStateListener;
     private volatile ConnectionState mConnectionState = ConnectionState.DISCONNECTED;
-    private volatile boolean mIsReconnecting;
+    // True from connect() until disconnect(), 4409, or an unrecoverable 401.
+    private boolean mWanted;
 
     private static final long RECONNECT_BASE_MS = 1000L;
     private static final long RECONNECT_MAX_MS = 30_000L;
     private static final double RECONNECT_JITTER = 0.3;
+    // Wi-Fi to mobile handoff fires several callbacks; reconnect once after they settle.
+    private static final long NETWORK_DEBOUNCE_MS = 300L;
     private int mReconnectAttempt;
     private final SecureRandom mReconnectRandom = new SecureRandom();
+    private final Runnable mReconnectRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (mWanted) openSocket();
+        }
+    };
+    private final Runnable mNetworkChangedRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mWanted || mAwaitingToken) return;
+            boolean newNetwork = mDefaultNetwork != null && !mDefaultNetwork.equals(mSocketNetwork);
+            if (newNetwork || mWebSocket == null) {
+                Log.d(TAG, "network changed: reconnecting now");
+                resetReconnectBackoff();
+                openSocket();
+            }
+        }
+    };
+    private ConnectivityManager.NetworkCallback mNetworkCallback;
+    private Network mDefaultNetwork;
+    private Network mSocketNetwork;
 
     // Session key -> last AUDIO arrival ms. Used to flag inter-arrival gaps.
     private final Map<String, Long> mLastAudioArrivalMs = new HashMap<>();
@@ -105,110 +127,15 @@ class OkConnection implements Connection {
 
     private volatile TokenProvider mTokenProvider;
     // True while awaiting a fresh JWT — suppresses backoff-driven reconnects.
-    private volatile boolean mAwaitingToken;
+    private boolean mAwaitingToken;
     private volatile Runnable mOnConnectedHook;
 
     OkConnection(Context context, IncomingAudioListener listener, Looper backgroundLooper) {
         mContext = context;
+        mConnectivityManager = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
         mIncomingAudioListener = listener;
         mMainHandler = new Handler(Looper.getMainLooper());
-        mBackgroundHandler = new Handler(backgroundLooper, new Handler.Callback() {
-
-            @Override
-            public boolean handleMessage(android.os.Message msg) {
-                switch (msg.what) {
-                    case CONNECTED:
-                        updateConnectionState(ConnectionState.CONNECTED);
-                        resetReconnectBackoff();
-                        send(MessageHelper.createConnectionMessage(mUserId));
-                        Runnable hook = mOnConnectedHook;
-                        if (hook != null) hook.run();
-                        Message dummyAckStart = MessageHelper.createAckStartMessage(mUserId, "00000", ChannelType.PRIVATE, System.currentTimeMillis());
-                        if (dummyAckStart != null) {
-                            send(dummyAckStart.getPayload());
-                        }
-                        if (mConnectCallback != null) {
-                            mMainHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (mConnectCallback != null) {
-                                        mConnectCallback.onConnected();
-                                        mConnectCallback = null;
-                                    }
-                                }
-                            });
-                        }
-                        return true;
-                    case DISCONNECTED:
-                        updateConnectionState(ConnectionState.DISCONNECTED);
-                        if (mDisconnectCallback != null) {
-                            mMainHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (mDisconnectCallback != null) {
-                                        mDisconnectCallback.onDisconnected();
-                                        mDisconnectCallback = null;
-                                    }
-                                }
-                            });
-                        }
-                        return true;
-                    case MESSAGE:
-                        Message message = (Message) msg.obj;
-                        if (message == null) return false;
-                        if (message.getMessageType() == MessageType.DUPLICATE_CONNECT) {
-                            mMainHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    disconnect(null);
-                                    if (mConnectionStateListener != null) {
-                                        mConnectionStateListener.onConnectionError(
-                                                new VoicePingException("DUPLICATE_CONNECT", ErrorCode.DUPLICATE_CONNECT));
-                                    }
-                                }
-                            });
-                        }
-                        if (mIncomingAudioListener != null && isIncomingMessageType(message.getMessageType())) {
-                            checkAudioGap(message);
-                            mIncomingAudioListener.onMessageReceived(message);
-                        }
-                        if (mOutgoingAudioListener != null && isOutgoingMessageType(message.getMessageType())) {
-                            mOutgoingAudioListener.onMessageReceived(message);
-                        }
-                        if (message.getMessageType() == MessageType.PRESENCE) {
-                            dispatchPresence(message);
-                        }
-                        return true;
-                    case FAILURE:
-                        if (mConnectionState == ConnectionState.DISCONNECTED) return true;
-                        if (mConnectionState == ConnectionState.CONNECTED) {
-                            updateConnectionState(ConnectionState.DISCONNECTED);
-                        }
-                        if (mConnectCallback != null) {
-                            mMainHandler.post(new Runnable() {
-                                @Override
-                                public void run() {
-                                    if (mConnectCallback != null) {
-                                        mConnectCallback.onFailed(new VoicePingException("Failed to connect!", ErrorCode.CONNECTION_FAILURE));
-                                        mConnectCallback = null;
-                                    }
-                                }
-                            });
-                        }
-                        if (mIncomingAudioListener != null) {
-                            mIncomingAudioListener.onConnectionFailure(new VoicePingException(
-                                    "Connection failure. Please check your internet connection!", ErrorCode.CONNECTION_FAILURE));
-                        }
-                        if (mOutgoingAudioListener != null) {
-                            mOutgoingAudioListener.onConnectionFailure(new VoicePingException(
-                                    "Connection failure. Please check your internet connection!", ErrorCode.CONNECTION_FAILURE));
-                        }
-                        reconnectWithDelay();
-                        return true;
-                }
-                return false;
-            }
-        });
+        mBackgroundHandler = new Handler(backgroundLooper);
     }
 
     private OkHttpClient createHttpClient(String serverUrl) {
@@ -283,10 +210,7 @@ class OkConnection implements Connection {
     private boolean isOutgoingMessageType(int messageType) {
         return messageType == MessageType.ACK_START
                 || messageType == MessageType.ACK_START_FAILED
-                || messageType == MessageType.ACK_END
-                || messageType == MessageType.MESSAGE_DELIVERED
-                || messageType == MessageType.MESSAGE_READ
-                || messageType == MessageType.UNAUTHORIZED_GROUP;
+                || messageType == MessageType.ACK_END;
     }
 
     @Override
@@ -314,38 +238,50 @@ class OkConnection implements Connection {
         mOnConnectedHook = hook;
     }
 
-    private void dispatchPresence(Message message) {
-        PresenceListener listener = mPresenceListener;
+    // Router events arrive as PRIVATE from 0 with a JSON string payload.
+    private void dispatchRouterEvent(final Message message) {
+        final PresenceListener listener = mPresenceListener;
         if (listener == null) return;
-        String channel = message.getReceiverId();
-        String json = message.getContent();
-        if (channel == null || json == null || json.isEmpty()) return;
+        int type = message.getMessageType();
+        final String json = message.getContent();
+        if (json == null || json.isEmpty()) return;
+        if (type == MessageType.NOTIFY) {
+            mMainHandler.post(() -> listener.onNotify(json));
+            return;
+        }
         try {
             JSONObject obj = new JSONObject(json);
-            String event = obj.optString("event", "");
-            if ("sync".equals(event)) {
-                JSONArray arr = obj.optJSONArray("members");
-                List<PresenceMember> list = new ArrayList<>();
-                if (arr != null) {
-                    for (int i = 0; i < arr.length(); i++) {
-                        JSONObject m = arr.getJSONObject(i);
-                        list.add(new PresenceMember(m.optString("clientId"), m.optString("data")));
+            if (type == MessageType.PRESENCE) {
+                String kind = obj.optString("kind", "");
+                if ("snapshot".equals(kind)) {
+                    final List<PersonPresence> people = new ArrayList<>();
+                    JSONArray peopleArr = obj.optJSONArray("people");
+                    if (peopleArr != null) {
+                        for (int i = 0; i < peopleArr.length(); i++) {
+                            people.add(parsePerson(peopleArr.getJSONObject(i)));
+                        }
                     }
-                }
-                mMainHandler.post(() -> listener.onPresenceSync(channel, list));
-            } else {
-                JSONObject m = obj.optJSONObject("member");
-                if (m == null) return;
-                PresenceMember member = new PresenceMember(m.optString("clientId"), m.optString("data"));
-                switch (event) {
-                    case "enter":  mMainHandler.post(() -> listener.onPresenceEnter(channel, member)); break;
-                    case "leave":  mMainHandler.post(() -> listener.onPresenceLeave(channel, member)); break;
-                    case "update": mMainHandler.post(() -> listener.onPresenceUpdate(channel, member)); break;
+                    final List<ChannelVersion> channels = new ArrayList<>();
+                    JSONArray chanArr = obj.optJSONArray("channels");
+                    if (chanArr != null) {
+                        for (int i = 0; i < chanArr.length(); i++) {
+                            JSONObject c = chanArr.getJSONObject(i);
+                            channels.add(new ChannelVersion(c.getString("id"), c.optString("v", "")));
+                        }
+                    }
+                    mMainHandler.post(() -> listener.onPresenceSnapshot(people, channels));
+                } else if ("presence".equals(kind)) {
+                    final PersonPresence person = parsePerson(obj);
+                    mMainHandler.post(() -> listener.onPresence(person));
                 }
             }
         } catch (Exception e) {
-            Log.w(TAG, "PRESENCE parse failed: " + e.getMessage());
+            Log.w(TAG, "router event parse failed: " + e.getMessage());
         }
+    }
+
+    private PersonPresence parsePerson(JSONObject o) throws Exception {
+        return new PersonPresence(o.getString("id"), o.getBoolean("online"), o.optString("v", ""));
     }
 
     @Override
@@ -354,21 +290,39 @@ class OkConnection implements Connection {
     }
 
     @Override
-    public void connect(@NotNull String serverUrl, @NotNull String userId, @NotNull String deviceId, @NotNull ConnectCallback callback) {
+    public void connect(@NotNull final String serverUrl, @NotNull final String token, @NotNull final ConnectCallback callback) {
         if (!NetworkUtil.isNetworkConnected(mContext)) {
             callback.onFailed(new VoicePingException("Please check your internet connection!", ErrorCode.INTERNET_DISCONNECTED));
             return;
         }
-        if (serverUrl.isEmpty() || userId.isEmpty() || deviceId.isEmpty()) {
+        if (serverUrl.isEmpty() || token.isEmpty()) {
             callback.onFailed(new VoicePingException("Invalid parameters!", ErrorCode.INTERNET_DISCONNECTED));
             return;
         }
-        mServerUrl = serverUrl;
-        mOkHttpClient = createHttpClient(serverUrl);
-        mUserId = userId;
-        mDeviceId = deviceId;
-        mConnectCallback = callback;
-        connect();
+        mBackgroundHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                mServerUrl = serverUrl;
+                mOkHttpClient = createHttpClient(serverUrl);
+                mToken = token;
+                mConnectCallback = callback;
+                start();
+            }
+        });
+    }
+
+    @Override
+    public void updateToken(@NotNull final String token) {
+        mBackgroundHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                if (mServerUrl == null) return;
+                mToken = token;
+                mAwaitingToken = false;
+                Log.d(TAG, "token updated: reconnecting");
+                start();
+            }
+        });
     }
 
     @NotNull
@@ -381,44 +335,79 @@ class OkConnection implements Connection {
         if (mConnectionState == connectionState) return;
         Log.d(TAG, "updateConnectionState: " + connectionState.name());
         mConnectionState = connectionState;
-        if (mConnectionStateListener != null) {
-            mConnectionStateListener.onConnectionStateChanged(connectionState);
+        ConnectionStateListener listener = mConnectionStateListener;
+        if (listener != null) {
+            listener.onConnectionStateChanged(connectionState);
         }
     }
 
-    private void connect() {
-        if (mServerUrl == null || mServerUrl.isEmpty()) return;
-        if (mOkHttpClient == null) return;
-        updateConnectionState(ConnectionState.CONNECTING);
-        Request request = new Request.Builder().url(mServerUrl)
-                .addHeader("VoicePingToken", mUserId != null ? mUserId : "")
-                .addHeader("DeviceId", mDeviceId != null ? mDeviceId : "")
-                .build();
-        Log.d(TAG, "Connecting. Request headers: " + request.headers().toString());
-        mWebSocket = mOkHttpClient.newWebSocket(request, new SocketListener());
-//        mOkHttpClient.dispatcher().executorService().shutdown();
+    // Starts (or restarts) the connection with the current token.
+    private void start() {
+        mWanted = true;
+        registerNetworkCallback();
+        resetReconnectBackoff();
+        openSocket();
     }
 
-    private void reconnectWithDelay() {
+    private void openSocket() {
+        if (mServerUrl == null || mServerUrl.isEmpty() || mOkHttpClient == null) return;
+        mBackgroundHandler.removeCallbacks(mReconnectRunnable);
+        // cancel(), not close(): the router quietly replaces a socket of the same deviceId,
+        // so no offline blip and no wait for a close handshake on a possibly dead link.
+        WebSocket old = mWebSocket;
+        mWebSocket = null;
+        if (old != null) old.cancel();
+        updateConnectionState(ConnectionState.CONNECTING);
+        mSocketNetwork = mDefaultNetwork;
+        Request request = new Request.Builder().url(mServerUrl)
+                .addHeader("token", mToken != null ? mToken : "")
+                .build();
+        Log.d(TAG, "Connecting...");
+        mWebSocket = mOkHttpClient.newWebSocket(request, new SocketListener());
+    }
+
+    private void registerNetworkCallback() {
+        if (mNetworkCallback != null || mConnectivityManager == null) return;
+        mDefaultNetwork = mConnectivityManager.getActiveNetwork();
+        mSocketNetwork = mDefaultNetwork;
+        mNetworkCallback = new ConnectivityManager.NetworkCallback() {
+            @Override
+            public void onAvailable(@NotNull Network network) {
+                mDefaultNetwork = network;
+                mBackgroundHandler.removeCallbacks(mNetworkChangedRunnable);
+                mBackgroundHandler.postDelayed(mNetworkChangedRunnable, NETWORK_DEBOUNCE_MS);
+            }
+
+            @Override
+            public void onLost(@NotNull Network network) {
+                if (network.equals(mDefaultNetwork)) mDefaultNetwork = null;
+            }
+        };
+        mConnectivityManager.registerDefaultNetworkCallback(mNetworkCallback, mBackgroundHandler);
+    }
+
+    private void unregisterNetworkCallback() {
+        if (mNetworkCallback == null || mConnectivityManager == null) return;
+        try {
+            mConnectivityManager.unregisterNetworkCallback(mNetworkCallback);
+        } catch (IllegalArgumentException ignored) {
+        }
+        mNetworkCallback = null;
+        mBackgroundHandler.removeCallbacks(mNetworkChangedRunnable);
+    }
+
+    // The one backoff path: 1 s doubling to 30 s, jittered.
+    private void scheduleReconnect() {
+        if (!mWanted) return;
         if (mAwaitingToken) {
             Log.d(TAG, "reconnect suppressed: awaiting fresh JWT");
             return;
         }
         updateConnectionState(ConnectionState.CONNECTING);
-        if (mIsReconnecting) return;
-        mIsReconnecting = true;
         long delay = nextReconnectDelayMs();
         Log.d(TAG, "reconnect scheduled in " + delay + "ms (attempt=" + mReconnectAttempt + ")");
-        Timer timer = new Timer();
-        timer.schedule(new TimerTask() {
-            @Override
-            public void run() {
-                mIsReconnecting = false;
-                if (mConnectionState == ConnectionState.CONNECTING) {
-                    connect();
-                }
-            }
-        }, delay);
+        mBackgroundHandler.removeCallbacks(mReconnectRunnable);
+        mBackgroundHandler.postDelayed(mReconnectRunnable, delay);
     }
 
     private long nextReconnectDelayMs() {
@@ -426,7 +415,7 @@ class OkConnection implements Connection {
         long capped = Math.min(exp, RECONNECT_MAX_MS);
         double jitter = 1.0 + (mReconnectRandom.nextDouble() * 2 - 1) * RECONNECT_JITTER;
         mReconnectAttempt++;
-        return Math.max(RECONNECT_BASE_MS, (long) (capped * jitter));
+        return Math.max(RECONNECT_BASE_MS, Math.min(RECONNECT_MAX_MS, (long) (capped * jitter)));
     }
 
     private void resetReconnectBackoff() {
@@ -436,7 +425,7 @@ class OkConnection implements Connection {
     private void handleTokenExpired() {
         TokenProvider provider = mTokenProvider;
         if (provider == null) {
-            mBackgroundHandler.sendEmptyMessage(FAILURE);
+            stopWith(new VoicePingException("Token expired", ErrorCode.TOKEN_EXPIRED));
             return;
         }
         Log.d(TAG, "TokenExpired: requesting fresh JWT");
@@ -444,109 +433,253 @@ class OkConnection implements Connection {
         updateConnectionState(ConnectionState.CONNECTING);
         provider.onTokenExpired(new TokenCallback() {
             @Override
-            public void onToken(@NotNull String jwt) {
-                mAwaitingToken = false;
-                mUserId = jwt;
-                resetReconnectBackoff();
-                Log.d(TAG, "TokenExpired: got fresh JWT, reconnecting");
+            public void onToken(@NotNull final String jwt) {
                 mBackgroundHandler.post(new Runnable() {
                     @Override
                     public void run() {
-                        connect();
+                        if (!mAwaitingToken || !mWanted) return;
+                        mAwaitingToken = false;
+                        mToken = jwt;
+                        resetReconnectBackoff();
+                        Log.d(TAG, "TokenExpired: got fresh JWT, reconnecting");
+                        openSocket();
                     }
                 });
             }
 
             @Override
-            public void onError(@NotNull Throwable e) {
+            public void onError(@NotNull final Throwable e) {
+                mBackgroundHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!mAwaitingToken) return;
+                        mAwaitingToken = false;
+                        Log.w(TAG, "TokenExpired: refresh failed, falling back to backoff: " + e.getMessage());
+                        scheduleReconnect();
+                    }
+                });
+            }
+        });
+    }
+
+    // Ends the connection without reconnecting and tells the app why (4409, unauthorized).
+    private void stopWith(final VoicePingException error) {
+        mWanted = false;
+        mAwaitingToken = false;
+        mBackgroundHandler.removeCallbacks(mReconnectRunnable);
+        unregisterNetworkCallback();
+        WebSocket old = mWebSocket;
+        mWebSocket = null;
+        if (old != null) old.cancel();
+        updateConnectionState(ConnectionState.DISCONNECTED);
+        ConnectionStateListener listener = mConnectionStateListener;
+        if (listener != null) listener.onConnectionError(error);
+        failPendingConnect(error);
+    }
+
+    private void failPendingConnect(final VoicePingException error) {
+        final ConnectCallback callback = mConnectCallback;
+        mConnectCallback = null;
+        if (callback != null) {
+            mMainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    callback.onFailed(error);
+                }
+            });
+        }
+    }
+
+    @Override
+    public void disconnect(final DisconnectCallback callback) {
+        mBackgroundHandler.post(new Runnable() {
+            @Override
+            public void run() {
+                Log.d(TAG, "close WebSocket...");
+                mWanted = false;
                 mAwaitingToken = false;
-                Log.w(TAG, "TokenExpired: refresh failed, falling back to backoff: " + e.getMessage());
-                mBackgroundHandler.sendEmptyMessage(FAILURE);
+                mBackgroundHandler.removeCallbacks(mReconnectRunnable);
+                unregisterNetworkCallback();
+                resetReconnectBackoff();
+                WebSocket ws = mWebSocket;
+                mWebSocket = null;
+                if (ws != null) {
+                    // Graceful close so the router marks the user offline at once.
+                    if (!ws.close(CLOSE_NORMAL, "client_shutdown")) ws.cancel();
+                }
+                updateConnectionState(ConnectionState.DISCONNECTED);
+                if (callback != null) {
+                    mMainHandler.post(new Runnable() {
+                        @Override
+                        public void run() {
+                            callback.onDisconnected();
+                        }
+                    });
+                }
             }
         });
     }
 
     @Override
-    public void disconnect(DisconnectCallback callback) {
-        if (callback != null) {
-            mDisconnectCallback = callback;
-        }
-        Log.d(TAG, "close WebSocket...");
-        resetReconnectBackoff();
-        if (mWebSocket != null) {
-            // Graceful close: flushes enqueued frames (LEAVE/UNSUBSCRIBE) and
-            // sends a close frame before tearing down. cancel() would discard
-            // the write queue, causing router to fall back to grace TTL for
-            // presence updates when the app is torn down while radio is cold.
-            boolean closing = mWebSocket.close(1000, "client_shutdown");
-            if (!closing) mWebSocket.cancel();
-        }
-        updateConnectionState(ConnectionState.DISCONNECTED);
-        if (mDisconnectCallback != null) {
-            mDisconnectCallback.onDisconnected();
-            mDisconnectCallback = null;
-        }
-    }
-
-    @Override
     public void send(byte[] data) {
-        if (mConnectionState != ConnectionState.CONNECTED) {
-            if (mOutgoingAudioListener != null) {
-                mOutgoingAudioListener.onSendMessageFailed(data, new VoicePingException("WebSocket is not connected!", ErrorCode.SOCKET_DISCONNECTED));
+        WebSocket ws = mWebSocket;
+        if (mConnectionState != ConnectionState.CONNECTED || ws == null) {
+            OutgoingAudioListener listener = mOutgoingAudioListener;
+            if (listener != null) {
+                listener.onSendMessageFailed(data, new VoicePingException("WebSocket is not connected!", ErrorCode.SOCKET_DISCONNECTED));
             }
             return;
         }
-        if (mWebSocket == null) return;
-        if (mWebSocket.queueSize() > SEND_QUEUE_DROP_THRESHOLD_BYTES) {
+        if (ws.queueSize() > SEND_QUEUE_DROP_THRESHOLD_BYTES) {
             mDroppedFrameCount++;
             if ((mDroppedFrameCount & 0x1F) == 0) {
                 Log.w(TAG, "send backpressure: dropped " + mDroppedFrameCount
-                        + " frames, queueSize=" + mWebSocket.queueSize());
+                        + " frames, queueSize=" + ws.queueSize());
             }
             return;
         }
-        mWebSocket.send(ByteString.of(data));
+        ws.send(ByteString.of(data));
+    }
+
+    // ---- socket events, all handled on the background thread ----
+
+    private void onSocketOpen(WebSocket ws) {
+        if (ws != mWebSocket) return;
+        updateConnectionState(ConnectionState.CONNECTED);
+        resetReconnectBackoff();
+        Runnable hook = mOnConnectedHook;
+        if (hook != null) hook.run();
+        final ConnectCallback callback = mConnectCallback;
+        mConnectCallback = null;
+        if (callback != null) {
+            mMainHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    callback.onConnected();
+                }
+            });
+        }
+    }
+
+    private void onSocketMessage(WebSocket ws, Message message) {
+        if (ws != mWebSocket) return;
+        int type = message.getMessageType();
+        if (mIncomingAudioListener != null && isIncomingMessageType(type)) {
+            checkAudioGap(message);
+            mIncomingAudioListener.onMessageReceived(message);
+        }
+        OutgoingAudioListener outgoing = mOutgoingAudioListener;
+        if (outgoing != null && isOutgoingMessageType(type)) {
+            outgoing.onMessageReceived(message);
+        }
+        if (type == MessageType.PRESENCE || type == MessageType.NOTIFY) {
+            dispatchRouterEvent(message);
+        }
+    }
+
+    private void onSocketEnded(WebSocket ws, int code, String reason) {
+        if (ws != mWebSocket) return;
+        mWebSocket = null;
+        if (code == CLOSE_SESSION_TAKEN) {
+            stopWith(new VoicePingException("Signed in on another device", ErrorCode.SESSION_TAKEN));
+            return;
+        }
+        if (code == CLOSE_NORMAL) {
+            // Replaced by another socket of this same device: nothing to restore or report.
+            Log.d(TAG, "socket closed normally: " + reason);
+            updateConnectionState(ConnectionState.DISCONNECTED);
+            return;
+        }
+        connectionLost();
+    }
+
+    private void onSocketFailure(WebSocket ws, Throwable t, Response response) {
+        if (ws != mWebSocket) return;
+        Log.d(TAG, "WebSocket onFailure, error: " + t.getMessage()
+                + (response != null ? ", response: " + response : ""));
+        mWebSocket = null;
+        if (response != null && response.code() == 401) {
+            // The status line is always "Unauthorized"; the router names an expired token in
+            // the RFC 6750 challenge so it can be refreshed instead of failing the login.
+            String challenge = response.header("WWW-Authenticate");
+            if (challenge != null && challenge.contains("TokenExpired")) {
+                handleTokenExpired();
+            } else {
+                stopWith(new VoicePingException("Unauthorized", ErrorCode.UNAUTHORIZED));
+            }
+            return;
+        }
+        connectionLost();
+    }
+
+    // Unexpected loss: tell talk listeners, then retry on the backoff.
+    private void connectionLost() {
+        if (!mWanted) return;
+        VoicePingException error = new VoicePingException(
+                "Connection failure. Please check your internet connection!", ErrorCode.CONNECTION_FAILURE);
+        failPendingConnect(new VoicePingException("Failed to connect!", ErrorCode.CONNECTION_FAILURE));
+        if (mIncomingAudioListener != null) mIncomingAudioListener.onConnectionFailure(error);
+        OutgoingAudioListener outgoing = mOutgoingAudioListener;
+        if (outgoing != null) outgoing.onConnectionFailure(error);
+        scheduleReconnect();
     }
 
     private class SocketListener extends WebSocketListener {
 
         @Override
-        public void onOpen(WebSocket webSocket, Response response) {
-            String responseString = response != null ? response.toString() : "";
-            Log.d(TAG, "WebSocket onOpen, response: " + responseString);
-            mBackgroundHandler.sendEmptyMessage(CONNECTED);
+        public void onOpen(final WebSocket webSocket, Response response) {
+            Log.d(TAG, "WebSocket onOpen");
+            mBackgroundHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    onSocketOpen(webSocket);
+                }
+            });
         }
 
         @Override
-        public void onMessage(WebSocket webSocket, ByteString bytes) {
-            Message message = MessageHelper.unpackMessage(bytes.toByteArray());
+        public void onMessage(final WebSocket webSocket, ByteString bytes) {
+            final Message message = MessageHelper.unpackMessage(bytes.toByteArray());
             if (message == null) return;
-//            Log.d(TAG, "message: " + MessageType.getText(message.getMessageType()));
-
-            android.os.Message msg = new android.os.Message();
-            msg.what = MESSAGE;
-            msg.obj = message;
-            mBackgroundHandler.sendMessage(msg);
+            mBackgroundHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    onSocketMessage(webSocket, message);
+                }
+            });
         }
 
         @Override
-        public void onClosed(WebSocket webSocket, int code, String reason) {
-            Log.d(TAG, "WebSocket onClosed, reason: " + reason);
-            mBackgroundHandler.sendEmptyMessage(DISCONNECTED);
+        public void onClosing(final WebSocket webSocket, final int code, final String reason) {
+            Log.d(TAG, "WebSocket onClosing, code: " + code + ", reason: " + reason);
+            webSocket.close(CLOSE_NORMAL, null);
+            mBackgroundHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    onSocketEnded(webSocket, code, reason);
+                }
+            });
         }
 
         @Override
-        public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-            Log.d(TAG, "WebSocket onFailure, error: " + t.getMessage());
-            t.printStackTrace();
-            if (response != null) Log.d(TAG, response.toString());
-            if (response != null && response.code() == 401
-                    && "TokenExpired".equalsIgnoreCase(response.message())
-                    && mTokenProvider != null) {
-                handleTokenExpired();
-                return;
-            }
-            mBackgroundHandler.sendEmptyMessage(FAILURE);
+        public void onClosed(final WebSocket webSocket, final int code, final String reason) {
+            Log.d(TAG, "WebSocket onClosed, code: " + code + ", reason: " + reason);
+            mBackgroundHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    onSocketEnded(webSocket, code, reason);
+                }
+            });
+        }
+
+        @Override
+        public void onFailure(final WebSocket webSocket, final Throwable t, final Response response) {
+            mBackgroundHandler.post(new Runnable() {
+                @Override
+                public void run() {
+                    onSocketFailure(webSocket, t, response);
+                }
+            });
         }
     }
 }

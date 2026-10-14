@@ -21,6 +21,7 @@ import com.smartwalkie.voicepingsdk.model.MessageType;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.ArrayDeque;
 import java.util.Arrays;
 
 
@@ -45,7 +46,13 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
     private RecorderThread mRecorderThread;
     private volatile long mStartRecordingTime;
     private long mLastRecordDuration;
-    private int mLastMessageType;
+    // START reply state. Audio is buffered and STOP deferred until the router answers START.
+    private final Object mSendLock = new Object();
+    private final ArrayDeque<byte[]> mPendingAudio = new ArrayDeque<>();
+    private boolean mStartAcked;
+    private boolean mStopDeferred;
+    private volatile long mStartSentAt;
+    private volatile long mRttMs;
     private AudioLocalSaver mAudioLocalSaver;
     private CustomAudioRecorder mCustomAudioRecorder;
 
@@ -57,7 +64,7 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
             if (mOutgoingTalkCallback != null) {
                 mOutgoingTalkCallback.onOutgoingTalkStarted(Recorder.this);
             }
-            sendAckStart();
+            sendStart();
             startRecording();
         }
     };
@@ -65,6 +72,7 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
         @Override
         public void run() {
             Log.d(TAG, "ACK_START Timeout!");
+            resetStartState();
             stopRecording();
             if (mOutgoingTalkCallback != null) {
                 mOutgoingTalkCallback.onOutgoingTalkError(new VoicePingException(
@@ -89,7 +97,11 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
         }
     };
 
-    private final int ACK_TIMEOUT_IN_MILLIS = 10 * 1000;
+    private static final int ACK_END_TIMEOUT_IN_MILLIS = 10 * 1000;
+    // START reply timeout follows the measured round trip: 4 x RTT, clamped. The upper bound
+    // is also how much audio is buffered while waiting.
+    private static final int ACK_START_TIMEOUT_MIN_IN_MILLIS = 3 * 1000;
+    private static final int ACK_START_TIMEOUT_MAX_IN_MILLIS = 5 * 1000;
 
     Recorder(Context context, Connection connection, AudioParam audioParam, Looper backgroundLooper) {
         mContext = context;
@@ -126,7 +138,7 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
         }
 
         // Connection check
-        if (mConnection.getConnectionState() == ConnectionState.DISCONNECTED) {
+        if (mConnection.getConnectionState() != ConnectionState.CONNECTED) {
             callback.onOutgoingTalkError(new VoicePingException("You are disconnected!", ErrorCode.SOCKET_DISCONNECTED));
             return;
         }
@@ -138,6 +150,7 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
         mChannel = new Channel(mChannelType, mUserId, mReceiverId);
         mOutgoingTalkCallback = callback;
         mIsRecording = true;
+        resetStartState();
         if (destinationPath != null && !destinationPath.isEmpty()) {
             mAudioLocalSaver = new AudioLocalSaver(destinationPath);
         }
@@ -179,23 +192,86 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
             mOutgoingTalkCallback.onOutgoingTalkStopped(isTooShort, isTooLong);
         }
 
-        // AckStop
-        sendAckStop();
+        // Stop: sent now if the router already accepted the talk, else right after START reply
+        synchronized (mSendLock) {
+            if (!mStartAcked) {
+                mStopDeferred = true;
+                return;
+            }
+        }
+        sendStop();
     }
 
-    private void sendAckStart() {
-//        Log.d(TAG, "sendAckStart");
-        Message message = MessageHelper.createAckStartMessage(
+    private void sendStart() {
+        Message message = MessageHelper.createStartMessage(
                 mUserId, mReceiverId, mChannelType, System.currentTimeMillis());
+        mStartSentAt = System.currentTimeMillis();
+        mBackgroundHandler.postDelayed(mAckStartTimeoutCheckRunner, ackStartTimeoutMs());
         mConnection.send(message.getPayload());
-        mBackgroundHandler.postDelayed(mAckStartTimeoutCheckRunner, ACK_TIMEOUT_IN_MILLIS);
     }
 
-    private void sendAckStop() {
-//        Log.d(TAG, "sendAckStop");
-        byte[] message = MessageHelper.createAckStopMessage(mUserId, mReceiverId, mChannelType);
+    private long ackStartTimeoutMs() {
+        return Math.max(ACK_START_TIMEOUT_MIN_IN_MILLIS,
+                Math.min(ACK_START_TIMEOUT_MAX_IN_MILLIS, 4 * mRttMs));
+    }
+
+    private void sendStop() {
+        byte[] message = MessageHelper.createStopMessage(mUserId, mReceiverId, mChannelType);
         mConnection.send(message);
-        mBackgroundHandler.postDelayed(mAckEndTimeoutCheckRunner, ACK_TIMEOUT_IN_MILLIS);
+        mBackgroundHandler.postDelayed(mAckEndTimeoutCheckRunner, ACK_END_TIMEOUT_IN_MILLIS);
+    }
+
+    private void resetStartState() {
+        synchronized (mSendLock) {
+            mStartAcked = false;
+            mStopDeferred = false;
+            mPendingAudio.clear();
+        }
+    }
+
+    /** Router accepted the talk: send what was buffered, then the deferred STOP. */
+    private void onStartAccepted() {
+        long sample = System.currentTimeMillis() - mStartSentAt;
+        mRttMs = mRttMs == 0 ? sample : (mRttMs * 3 + sample) / 4;
+        boolean stop;
+        synchronized (mSendLock) {
+            mStartAcked = true;
+            byte[] chunk;
+            while ((chunk = mPendingAudio.poll()) != null) {
+                mConnection.send(chunk);
+            }
+            stop = mStopDeferred;
+            mStopDeferred = false;
+        }
+        if (mOutgoingTalkCallback != null) {
+            mOutgoingTalkCallback.onOutgoingTalkLive();
+        }
+        if (stop) sendStop();
+    }
+
+    /** Audio chunk from the recorder thread: buffered until START is accepted. */
+    private void sendAudio(byte[] frame) {
+        synchronized (mSendLock) {
+            if (mStartAcked) {
+                mConnection.send(frame);
+                return;
+            }
+            // Drop beyond ~5 s; the START timeout ends the talk by then anyway.
+            if (mPendingAudio.size() < maxPendingChunks()) mPendingAudio.add(frame);
+        }
+    }
+
+    private int maxPendingChunks() {
+        long chunkMs = Math.max(1, 1000L * mAudioParam.getFrameSize() * mAudioParam.getFramePerSent()
+                / mAudioParam.getSampleRate());
+        return (int) Math.ceil((double) ACK_START_TIMEOUT_MAX_IN_MILLIS / chunkMs);
+    }
+
+    private static int startFailedErrorCode(String reason) {
+        if ("NotAllowed".equals(reason)) return ErrorCode.START_NOT_ALLOWED;
+        if ("Busy".equals(reason)) return ErrorCode.START_BUSY;
+        if ("Offline".equals(reason)) return ErrorCode.START_OFFLINE;
+        return ErrorCode.START_ERROR;
     }
 
     private void startRecording() {
@@ -228,59 +304,26 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
     public void onMessageReceived(Message message) {
         int messageType = message.getMessageType();
         Log.d(TAG, "onMessageReceived: " + MessageType.getText(messageType));
-        if (messageType == MessageType.ACK_START_FAILED
-                && mLastMessageType == MessageType.UNAUTHORIZED_GROUP) {
-            return;
-        }
-        mLastMessageType = messageType;
         switch (messageType) {
             case MessageType.ACK_START:
-//                Log.d(TAG, "onAckStartSucceed: " + message);
                 mBackgroundHandler.removeCallbacks(mAckStartTimeoutCheckRunner);
+                onStartAccepted();
                 break;
             case MessageType.ACK_START_FAILED:
-//                Log.d(TAG, "onAckStartFailed: " + message);
-//                Log.d(TAG, "ackids: " + message.getAckIds());
                 mBackgroundHandler.removeCallbacks(mAckStartTimeoutCheckRunner);
+                resetStartState();
                 stopRecording();
                 if (mOutgoingTalkCallback != null) {
-                    mOutgoingTalkCallback.onOutgoingTalkError(
-                            new VoicePingException("ACK_START_FAILED. Failed to initiate PTT Talk!", ErrorCode.ACK_START_FAILED));
+                    String reason = message.getContent();
+                    mOutgoingTalkCallback.onOutgoingTalkError(new VoicePingException(
+                            "START_FAILED: " + reason, startFailedErrorCode(reason)));
                     mOutgoingTalkCallback = null;
                 }
                 break;
             case MessageType.ACK_END:
-//                Log.d(TAG, "onAckEndSucceed: " + message);
-//                Log.d(TAG, "ackids: " + message.getAckIds());
                 mBackgroundHandler.removeCallbacks(mAckEndTimeoutCheckRunner);
-                if (!mIsRecording && mOutgoingTalkCallback != null) {
-                    String serverUrl = mConnection.getServerUrl();
-                    if (serverUrl == null) break;
-                    if (serverUrl.startsWith("ws")) {
-                        serverUrl = serverUrl.replaceFirst("ws", "http");
-                    }
-                    String downloadUrl = serverUrl + "/files/audio/" + message.getAckIds();
-                    if (mLastRecordDuration < mAudioParam.getMinDuration()) {
-                        downloadUrl = null;
-                    }
-//                    Log.d(TAG, "last record duration: " + mLastRecordDuration);
+                if (!mIsRecording) {
                     mLastRecordDuration = 0;
-//                    mOutgoingTalkCallback.onDownloadUrlReceived(downloadUrl);
-                    mOutgoingTalkCallback = null;
-                }
-                break;
-            case MessageType.MESSAGE_DELIVERED:
-//                Log.d(TAG, "onMessageDelivered: " + message);
-                break;
-            case MessageType.MESSAGE_READ:
-//                Log.d(TAG, "onMessageRead: " + message);
-                break;
-            case MessageType.UNAUTHORIZED_GROUP:
-                mBackgroundHandler.removeCallbacks(mAckStartTimeoutCheckRunner);
-                stopRecording();
-                if (mOutgoingTalkCallback != null) {
-                    mOutgoingTalkCallback.onOutgoingTalkError(
-                            new VoicePingException("UNAUTHORIZED_GROUP. Failed to initiate PTT Talk!", ErrorCode.UNAUTHORIZED_GROUP));
                     mOutgoingTalkCallback = null;
                 }
                 break;
@@ -290,7 +333,10 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
     @Override
     public void onSendMessageFailed(byte[] data, VoicePingException e) {
         Message message = MessageHelper.unpackMessage(data);
-        if (message != null && message.getMessageType() == MessageType.ACK_START) {
+        if (message != null && message.getMessageType() == MessageType.START_TALKING) {
+            mBackgroundHandler.removeCallbacks(mAckStartTimeoutCheckRunner);
+            resetStartState();
+            stopRecording();
             if (mOutgoingTalkCallback != null) {
                 mOutgoingTalkCallback.onOutgoingTalkError(e);
                 mOutgoingTalkCallback = null;
@@ -462,7 +508,7 @@ class Recorder implements OutgoingAudioListener, AudioRecorder {
 //            Log.d(TAG, "send voice message, counter: " + counter + ", total data: " + accumulatedData.length);
             Message message = MessageHelper.createAudioMessage(mUserId, mReceiverId,
                     mChannelType, accumulatedData, accumulatedData.length);
-            if (message != null) mConnection.send(message.getPayload());
+            if (message != null) sendAudio(message.getPayload());
         }
 
         private void reset() {

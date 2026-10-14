@@ -1,14 +1,26 @@
 package com.smartwalkie.voicepingsdk.listener
 
 /**
- * Presence event listener. Fires on router PRESENCE messages after subscribing to a channel.
- * `sync` fires once per SUBSCRIBE (initial snapshot). enter/leave/update fire as deltas.
+ * Router events that arrive on the open connection. Callbacks fire on the main thread.
+ *
+ * Versions are opaque strings from the router; keep the newest per id so an older reply never
+ * overwrites a newer event.
  */
 interface PresenceListener {
-    fun onPresenceSync(channel: String, members: List<PresenceMember>)
-    fun onPresenceEnter(channel: String, member: PresenceMember)
-    fun onPresenceLeave(channel: String, member: PresenceMember)
-    fun onPresenceUpdate(channel: String, member: PresenceMember)
+    /**
+     * Reply to [com.smartwalkie.voicepingsdk.VoicePing.peopleSub]: the current state of every
+     * allowed id, and each channel whose version differs from the one sent.
+     */
+    fun onPresenceSnapshot(people: List<PersonPresence>, channels: List<ChannelVersion>)
+
+    /** One person changed. */
+    fun onPresence(person: PersonPresence)
+
+    /** An app event from the backend, forwarded unread by the router. [payload] is its JSON. */
+    fun onNotify(payload: String)
 }
 
-data class PresenceMember(val clientId: String, val data: String)
+data class PersonPresence(val id: String, val online: Boolean, val version: String)
+
+/** Version of a channel; [id] is the full channel id the app subscribed with. */
+data class ChannelVersion(val id: String, val version: String)

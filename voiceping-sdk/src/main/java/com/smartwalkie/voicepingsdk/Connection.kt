@@ -25,11 +25,14 @@ internal interface Connection {
 
     val serverUrl: String?
 
-    fun connect(serverUrl: String, userId: String, deviceId: String, callback: ConnectCallback)
+    fun connect(serverUrl: String, token: String, callback: ConnectCallback)
+
+    /** Replaces the token and reconnects once to use it. */
+    fun updateToken(token: String)
 
     val connectionState: ConnectionState
 
-    fun disconnect(callback: DisconnectCallback)
+    fun disconnect(callback: DisconnectCallback?)
 
     fun send(data: ByteArray)
 }

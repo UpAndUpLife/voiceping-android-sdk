@@ -95,7 +95,7 @@ class LoginActivity : AppCompatActivity(), PermissionCallbacks {
                 // Show a progress spinner, and kick off a background task to perform the user connect attempt.
                 Utils.closeKeyboard(this, currentFocus)
                 showProgress(true)
-                VoicePing.connect(serverUrl, userId, company, object : ConnectCallback {
+                VoicePing.connect(serverUrl, company /* JWT */, userId, object : ConnectCallback {
                     override fun onConnected() {
                         Log.v(TAG, "onConnected")
                         showProgress(false)
