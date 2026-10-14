@@ -7,20 +7,20 @@ package com.smartwalkie.voicepingsdk.listener
  * overwrites a newer event.
  */
 interface PresenceListener {
-    /** Reply to [com.smartwalkie.voicepingsdk.VoicePing.peopleSub]: the current state of every allowed id. */
-    fun onPresenceSnapshot(people: List<PersonPresence>, sites: List<SiteVersion>)
+    /**
+     * Reply to [com.smartwalkie.voicepingsdk.VoicePing.peopleSub]: the current state of every
+     * allowed id, and each channel whose version differs from the one sent.
+     */
+    fun onPresenceSnapshot(people: List<PersonPresence>, channels: List<ChannelVersion>)
 
     /** One person changed. */
     fun onPresence(person: PersonPresence)
 
-    /** The team changed: refetch the team list, then call peopleSub again. */
-    fun onTeamChanged()
-
-    /** Duty changed at a site this connection listens to. */
-    fun onSiteStatus(site: SiteVersion)
+    /** An app event from the backend, forwarded unread by the router. [payload] is its JSON. */
+    fun onNotify(payload: String)
 }
 
 data class PersonPresence(val id: String, val online: Boolean, val version: String)
 
-/** Duty version of a site; [id] is the bare site id, without the "site:" prefix. */
-data class SiteVersion(val id: String, val version: String)
+/** Version of a channel; [id] is the full channel id the app subscribed with. */
+data class ChannelVersion(val id: String, val version: String)

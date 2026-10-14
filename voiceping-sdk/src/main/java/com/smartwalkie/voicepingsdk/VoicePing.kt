@@ -26,11 +26,11 @@ object VoicePing {
 
     private var userId: String? = null
 
-    // Sites the app listens to via subscribeSite() and the last peopleSub() request. Both are
+    // Channels the app listens to via subscribe() and the last peopleSub() request. Both are
     // re-sent on every CONNECTED transition: the router keeps neither across a socket.
-    private val activeSites = linkedSetOf<String>()
+    private val activeChannels = linkedSetOf<String>()
     private var lastPeopleIds: List<String>? = null
-    private var lastPeopleSites: Map<String, String> = emptyMap()
+    private var lastPeopleChannels: Map<String, String> = emptyMap()
 
     /**
      * Stable per-install device identifier. The router replaces a socket quietly when the
@@ -112,10 +112,10 @@ object VoicePing {
      * @param callback Callback
      */
     fun disconnect(callback: DisconnectCallback) {
-        synchronized(activeSites) {
-            activeSites.clear()
+        synchronized(activeChannels) {
+            activeChannels.clear()
             lastPeopleIds = null
-            lastPeopleSites = emptyMap()
+            lastPeopleChannels = emptyMap()
         }
         connection.disconnect(callback)
     }
@@ -132,7 +132,7 @@ object VoicePing {
     /**
      * Set ConnectionStateListener to VoicePing.
      *
-     * onConnectionStateChanged(CONNECTED) fires on every reconnect. The SDK re-sends site
+     * onConnectionStateChanged(CONNECTED) fires on every reconnect. The SDK re-sends channel
      * subscriptions and the last peopleSub() itself.
      *
      * onConnectionError fires once and the SDK stops reconnecting for:
@@ -148,7 +148,7 @@ object VoicePing {
 
     /**
      * Register a PresenceListener. Callbacks fire on the main thread.
-     * Presence snapshot, presence deltas, team changed and site status events arrive here.
+     * Presence snapshot, presence deltas and app notify events arrive here.
      */
     fun setPresenceListener(listener: PresenceListener?) {
         connection.setPresenceListener(listener)
@@ -168,63 +168,63 @@ object VoicePing {
     }
 
     /**
-     * Listen to a site: duty changes arrive as onSiteStatus, and the site's talks are heard.
+     * Listen to a group channel: its talks are heard and its notify events arrive as onNotify.
      * Re-sent automatically after every reconnect.
      *
-     * @param siteId Bare site id (the SDK adds the "site:" prefix)
+     * @param channel Full channel id, as the app's backend names it
      */
-    fun subscribeSite(siteId: String) {
+    fun subscribe(channel: String) {
         val uid = userId ?: return
-        synchronized(activeSites) { activeSites.add(siteId) }
+        synchronized(activeChannels) { activeChannels.add(channel) }
         if (connection.connectionState == ConnectionState.CONNECTED) {
-            connection.send(MessageHelper.createSubscribeSiteMessage(uid, siteId))
+            connection.send(MessageHelper.createSubscribeMessage(uid, channel))
         }
     }
 
     /**
-     * Stop listening to a site.
+     * Stop listening to a group channel.
      */
-    fun unsubscribeSite(siteId: String) {
+    fun unsubscribe(channel: String) {
         val uid = userId ?: return
-        synchronized(activeSites) { activeSites.remove(siteId) }
+        synchronized(activeChannels) { activeChannels.remove(channel) }
         if (connection.connectionState == ConnectionState.CONNECTED) {
-            connection.send(MessageHelper.createUnsubscribeSiteMessage(uid, siteId))
+            connection.send(MessageHelper.createUnsubscribeMessage(uid, channel))
         }
     }
 
     /**
      * Replace the whole presence subscription. The router answers with onPresenceSnapshot
-     * (current state of every id you may see, and of each site whose duty version differs),
-     * then sends onPresence deltas. Call again with the new list after onTeamChanged and the
-     * team refetch. Re-sent automatically after every reconnect.
+     * (current state of every id you may see, and of each channel whose version differs),
+     * then sends onPresence deltas. Call again whenever the app's list changes.
+     * Re-sent automatically after every reconnect.
      *
-     * @param ids   Person ids to watch (at most 1000; extra ids are dropped)
-     * @param sites Bare site id to the duty version the app already holds
+     * @param ids      Person ids to watch (at most 1000; extra ids are dropped)
+     * @param channels Channel id to the version the app already holds
      */
-    fun peopleSub(ids: List<String>, sites: Map<String, String>) {
+    fun peopleSub(ids: List<String>, channels: Map<String, String>) {
         val uid = userId ?: return
         val limited = ids.take(MAX_PEOPLE_IDS)
-        synchronized(activeSites) {
+        synchronized(activeChannels) {
             lastPeopleIds = limited
-            lastPeopleSites = sites.toMap()
+            lastPeopleChannels = channels.toMap()
         }
         if (connection.connectionState == ConnectionState.CONNECTED) {
-            connection.send(MessageHelper.createPeopleSubMessage(uid, limited, sites))
+            connection.send(MessageHelper.createPeopleSubMessage(uid, limited, channels))
         }
     }
 
     private fun replaySubscriptions() {
         val uid = userId ?: return
-        val sites: List<String>
+        val channels: List<String>
         val ids: List<String>?
         val versions: Map<String, String>
-        synchronized(activeSites) {
-            sites = activeSites.toList()
+        synchronized(activeChannels) {
+            channels = activeChannels.toList()
             ids = lastPeopleIds
-            versions = lastPeopleSites
+            versions = lastPeopleChannels
         }
-        for (site in sites) {
-            connection.send(MessageHelper.createSubscribeSiteMessage(uid, site))
+        for (channel in channels) {
+            connection.send(MessageHelper.createSubscribeMessage(uid, channel))
         }
         if (ids != null) {
             connection.send(MessageHelper.createPeopleSubMessage(uid, ids, versions))
@@ -244,7 +244,7 @@ object VoicePing {
     /**
      * Start PTT Talk using VoicePing's PTT functionality.
      *
-     * @param receiverId  Receiver user id for private channel, or "site:<siteId>" for a site talk
+     * @param receiverId  Receiver user id for private channel, or a group channel id
      * @param channelType ChannelType.PRIVATE or ChannelType.GROUP
      * @param callback    OutgoingTalkCallback
      */
@@ -256,7 +256,7 @@ object VoicePing {
      * Start PTT Talk using VoicePing's PTT functionality. Save recorded audio to the destination
      * path at the end of the talk. The saved file can be played using VoicePingPlayer.
      *
-     * @param receiverId      Receiver user id for private channel, or "site:<siteId>" for a site talk
+     * @param receiverId      Receiver user id for private channel, or a group channel id
      * @param channelType     ChannelType.PRIVATE or ChannelType.GROUP
      * @param callback        OutgoingTalkCallback
      * @param destinationPath Destination path
@@ -275,7 +275,7 @@ object VoicePing {
      * path at the end of the talk. The saved file can be played using VoicePingPlayer. Add custom
      * audio recorder using CustomAudioRecorder.
      *
-     * @param receiverId      Receiver user id for private channel, or "site:<siteId>" for a site talk
+     * @param receiverId      Receiver user id for private channel, or a group channel id
      * @param channelType     ChannelType.PRIVATE or ChannelType.GROUP
      * @param callback        OutgoingTalkCallback
      * @param destinationPath Destination path

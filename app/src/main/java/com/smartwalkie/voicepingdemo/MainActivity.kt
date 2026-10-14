@@ -232,7 +232,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener,
             return
         }
         log("joinGroup, group ID: $groupId")
-        VoicePing.subscribeSite(groupId)
+        VoicePing.subscribe(groupId)
         showToast("Joined to $groupId")
         Utils.closeKeyboard(this, currentFocus)
     }
@@ -245,7 +245,7 @@ class MainActivity : AppCompatActivity(), AdapterView.OnItemSelectedListener,
             return
         }
         log("leaveGroup, group ID: $groupId")
-        VoicePing.unsubscribeSite(groupId)
+        VoicePing.unsubscribe(groupId)
         showToast("Left from $groupId")
         Utils.closeKeyboard(this, currentFocus)
     }

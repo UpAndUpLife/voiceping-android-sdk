@@ -12,8 +12,7 @@ object MessageType {
     const val UNSUBSCRIBE = 29
     const val PRESENCE = 33
     const val PEOPLE_SUB = 34
-    const val TEAM_CHANGED = 35
-    const val SITE_STATUS = 36
+    const val NOTIFY = 35
 
     @JvmStatic
     fun getText(messageType: Int): String {
@@ -28,8 +27,7 @@ object MessageType {
             UNSUBSCRIBE -> "UNSUBSCRIBE"
             PRESENCE -> "PRESENCE"
             PEOPLE_SUB -> "PEOPLE_SUB"
-            TEAM_CHANGED -> "TEAM_CHANGED"
-            SITE_STATUS -> "SITE_STATUS"
+            NOTIFY -> "NOTIFY"
             else -> "UNKNOWN"
         }
     }

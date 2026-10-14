@@ -17,7 +17,7 @@ import com.smartwalkie.voicepingsdk.listener.IncomingAudioListener;
 import com.smartwalkie.voicepingsdk.listener.OutgoingAudioListener;
 import com.smartwalkie.voicepingsdk.listener.PersonPresence;
 import com.smartwalkie.voicepingsdk.listener.PresenceListener;
-import com.smartwalkie.voicepingsdk.listener.SiteVersion;
+import com.smartwalkie.voicepingsdk.listener.ChannelVersion;
 import com.smartwalkie.voicepingsdk.listener.TokenCallback;
 import com.smartwalkie.voicepingsdk.listener.TokenProvider;
 import com.smartwalkie.voicepingsdk.model.Message;
@@ -243,18 +243,15 @@ class OkConnection implements Connection {
         final PresenceListener listener = mPresenceListener;
         if (listener == null) return;
         int type = message.getMessageType();
-        if (type == MessageType.TEAM_CHANGED) {
-            mMainHandler.post(listener::onTeamChanged);
+        final String json = message.getContent();
+        if (json == null || json.isEmpty()) return;
+        if (type == MessageType.NOTIFY) {
+            mMainHandler.post(() -> listener.onNotify(json));
             return;
         }
-        String json = message.getContent();
-        if (json == null || json.isEmpty()) return;
         try {
             JSONObject obj = new JSONObject(json);
-            if (type == MessageType.SITE_STATUS) {
-                final SiteVersion site = new SiteVersion(obj.getString("site"), obj.optString("v", ""));
-                mMainHandler.post(() -> listener.onSiteStatus(site));
-            } else if (type == MessageType.PRESENCE) {
+            if (type == MessageType.PRESENCE) {
                 String kind = obj.optString("kind", "");
                 if ("snapshot".equals(kind)) {
                     final List<PersonPresence> people = new ArrayList<>();
@@ -264,15 +261,15 @@ class OkConnection implements Connection {
                             people.add(parsePerson(peopleArr.getJSONObject(i)));
                         }
                     }
-                    final List<SiteVersion> sites = new ArrayList<>();
-                    JSONArray siteArr = obj.optJSONArray("sites");
-                    if (siteArr != null) {
-                        for (int i = 0; i < siteArr.length(); i++) {
-                            JSONObject s = siteArr.getJSONObject(i);
-                            sites.add(new SiteVersion(s.getString("id"), s.optString("v", "")));
+                    final List<ChannelVersion> channels = new ArrayList<>();
+                    JSONArray chanArr = obj.optJSONArray("channels");
+                    if (chanArr != null) {
+                        for (int i = 0; i < chanArr.length(); i++) {
+                            JSONObject c = chanArr.getJSONObject(i);
+                            channels.add(new ChannelVersion(c.getString("id"), c.optString("v", "")));
                         }
                     }
-                    mMainHandler.post(() -> listener.onPresenceSnapshot(people, sites));
+                    mMainHandler.post(() -> listener.onPresenceSnapshot(people, channels));
                 } else if ("presence".equals(kind)) {
                     final PersonPresence person = parsePerson(obj);
                     mMainHandler.post(() -> listener.onPresence(person));
@@ -575,8 +572,7 @@ class OkConnection implements Connection {
         if (outgoing != null && isOutgoingMessageType(type)) {
             outgoing.onMessageReceived(message);
         }
-        if (type == MessageType.PRESENCE || type == MessageType.TEAM_CHANGED
-                || type == MessageType.SITE_STATUS) {
+        if (type == MessageType.PRESENCE || type == MessageType.NOTIFY) {
             dispatchRouterEvent(message);
         }
     }
@@ -603,7 +599,10 @@ class OkConnection implements Connection {
                 + (response != null ? ", response: " + response : ""));
         mWebSocket = null;
         if (response != null && response.code() == 401) {
-            if ("TokenExpired".equalsIgnoreCase(response.message())) {
+            // The status line is always "Unauthorized"; the router names an expired token in
+            // the RFC 6750 challenge so it can be refreshed instead of failing the login.
+            String challenge = response.header("WWW-Authenticate");
+            if (challenge != null && challenge.contains("TokenExpired")) {
                 handleTokenExpired();
             } else {
                 stopWith(new VoicePingException("Unauthorized", ErrorCode.UNAUTHORIZED));

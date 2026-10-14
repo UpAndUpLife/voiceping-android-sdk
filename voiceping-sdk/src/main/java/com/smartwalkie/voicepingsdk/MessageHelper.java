@@ -17,7 +17,6 @@ import java.io.IOException;
 import java.util.List;
 
 class MessageHelper {
-    static final String SITE_PREFIX = "site:";
 
     private static final MessagePack mMessagePack = new MessagePack();
 
@@ -54,10 +53,10 @@ class MessageHelper {
                 message.setAckIds(unpacker.readString());
             } else if (messageType == MessageType.ACK_START_FAILED
                     || messageType == MessageType.PRESENCE
-                    || messageType == MessageType.SITE_STATUS) {
+                    || messageType == MessageType.NOTIFY) {
                 message.setContent(unpacker.readString());
             }
-            // ACK_START, ACK_END, TEAM_CHANGED: nothing to read.
+            // ACK_START, ACK_END: nothing to read.
             stream.close();
             return message;
         } catch (Exception e) {
@@ -138,20 +137,20 @@ class MessageHelper {
         return out.toByteArray();
     }
 
-    public static byte[] createSubscribeSiteMessage(String senderId, String siteId) {
-        return createRouterFrame(MessageType.SUBSCRIBE, senderId, SITE_PREFIX + siteId, "");
+    public static byte[] createSubscribeMessage(String senderId, String channel) {
+        return createRouterFrame(MessageType.SUBSCRIBE, senderId, channel, "");
     }
 
-    public static byte[] createUnsubscribeSiteMessage(String senderId, String siteId) {
-        return createRouterFrame(MessageType.UNSUBSCRIBE, senderId, SITE_PREFIX + siteId, "");
+    public static byte[] createUnsubscribeMessage(String senderId, String channel) {
+        return createRouterFrame(MessageType.UNSUBSCRIBE, senderId, channel, "");
     }
 
-    /** Replaces the whole people/duty subscription: {"ids":[...],"sites":{"<siteId>":"<dutyVersion>"}}. */
-    public static byte[] createPeopleSubMessage(String senderId, List<String> ids, java.util.Map<String, String> sites) {
+    /** Replaces the whole people/channel subscription: {"ids":[...],"channels":{"<channel>":"<version>"}}. */
+    public static byte[] createPeopleSubMessage(String senderId, List<String> ids, java.util.Map<String, String> channels) {
         JSONObject body = new JSONObject();
         try {
             body.put("ids", new JSONArray(ids));
-            body.put("sites", new JSONObject(sites));
+            body.put("channels", new JSONObject(channels));
         } catch (Exception e) {
             e.printStackTrace();
         }
